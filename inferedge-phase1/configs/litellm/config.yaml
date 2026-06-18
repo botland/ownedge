@@ -1,0 +1,6 @@
+model_list:
+  - model_name: default
+    litellm_params:
+      model: openai/compatible
+      api_base: http://inferedge-vllm:8000/v1
+      api_key: dummy

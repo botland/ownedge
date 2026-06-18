@@ -1,0 +1,6 @@
+.env
+__pycache__/
+*.log
+storage/models/*
+!storage/models/.gitkeep
+controller/.venv/

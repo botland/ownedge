@@ -1,0 +1,99 @@
+version: '3.9'
+
+services:
+  traefik:
+    image: traefik:v3.0
+    command:
+      - "--api.dashboard=false"
+      - "--providers.docker=true"
+      - "--providers.docker.exposedbydefault=false"
+      - "--providers.docker.network=inferedge_default"
+      - "--entrypoints.web.address=:80"
+    ports:
+      - "80:80"
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+      - ./configs/traefik/traefik.yml:/etc/traefik/traefik.yml:ro
+    networks:
+      - inferedge_default
+    restart: unless-stopped
+
+  litellm:
+    image: ghcr.io/berriai/litellm:main-stable
+    command: --config /app/config.yaml
+    volumes:
+      - ./configs/litellm/config.yaml:/app/config.yaml
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.litellm.rule=Host(`localhost`)"
+      - "traefik.http.services.litellm.loadbalancer.server.port=4000"
+    networks:
+      - inferedge_default
+    depends_on:
+      - controller
+    restart: unless-stopped
+
+  minio:
+    image: minio/minio:latest
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD}
+    volumes:
+      - minio_data:/data
+    networks:
+      - inferedge_default
+    restart: unless-stopped
+
+  controller:
+    build: ./controller
+    shm_size: "2gb"
+    ports:
+      - "${CONTROLLER_PORT}:${CONTROLLER_PORT}"
+    environment:
+      - APPLIANCE_ID=${APPLIANCE_ID}
+      - COMPOSE_PROJECT_NAME=${COMPOSE_PROJECT_NAME}
+      - SQLITE_DB_PATH=${SQLITE_DB_PATH}
+      - LOCAL_MODEL_CACHE=${LOCAL_MODEL_CACHE}
+      - DEFAULT_MODEL=${DEFAULT_MODEL}
+      - DEFAULT_CONTEXT=${DEFAULT_CONTEXT}
+      - GPU_UTILIZATION=${GPU_UTILIZATION}
+      - GPU_PROFILE=${GPU_PROFILE}
+      - HF_TOKEN=${HF_TOKEN}
+      - CONTROLLER_PORT=${CONTROLLER_PORT}
+      - CONTROLLER_API_TOKEN=${CONTROLLER_API_TOKEN}
+      - RAY_HEAD_PORT=${RAY_HEAD_PORT}
+      - RAY_DASHBOARD_PORT=${RAY_DASHBOARD_PORT}
+      - VLLM_INTERNAL_PORT=${VLLM_INTERNAL_PORT}
+      - VLLM_IMAGE=${VLLM_IMAGE}
+      - VLLM_CONTAINER_STARTUP_TIMEOUT_SEC=${VLLM_CONTAINER_STARTUP_TIMEOUT_SEC}
+      - VLLM_PROBE_TIMEOUT_SEC=${VLLM_PROBE_TIMEOUT_SEC}
+      - RECONCILE_INTERVAL_SEC=${RECONCILE_INTERVAL_SEC}
+    volumes:
+      - controller_data:/data
+      - ${LOCAL_MODEL_CACHE}:/models_cache
+      - /var/run/docker.sock:/var/run/docker.sock:rw
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://localhost:${CONTROLLER_PORT}/status"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    networks:
+      - inferedge_default
+    restart: unless-stopped
+
+volumes:
+  minio_data:
+  controller_data:
+
+networks:
+  inferedge_default:
+    name: inferedge_default
