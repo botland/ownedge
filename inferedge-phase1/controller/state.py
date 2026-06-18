@@ -142,29 +142,57 @@ def _now_iso() -> str:
 
 
 async def seed_defaults() -> None:
+    """Seed SQLite and sync .env model settings into the intent log when they change."""
     db = await get_db()
     default_model = os.environ.get("DEFAULT_MODEL", "meta-llama/Llama-3.1-8B-Instruct")
     default_context = int(os.environ.get("DEFAULT_CONTEXT", "8192"))
     default_util = float(os.environ.get("GPU_UTILIZATION", "0.85"))
+
+    await db.execute(
+        """INSERT INTO model_aliases (alias, model_id) VALUES (?, ?)
+           ON CONFLICT(alias) DO UPDATE SET model_id = excluded.model_id""",
+        ("default", default_model),
+    )
+    await db.execute(
+        "INSERT OR IGNORE INTO model_aliases (alias, model_id) VALUES (?, ?)",
+        ("llama-3.1-8b", "meta-llama/Llama-3.1-8B-Instruct"),
+    )
+    await db.commit()
+
+    resolved_env_model = await resolve_model(default_model)
 
     async with db.execute("SELECT model FROM desired_state WHERE id = 1") as cur:
         row = await cur.fetchone()
     if row is None:
         await db.execute(
             "INSERT INTO desired_state (id, model, context_length, gpu_utilization) VALUES (1, ?, ?, ?)",
-            (default_model, default_context, default_util),
+            (resolved_env_model, default_context, default_util),
         )
+        await db.commit()
+        logger.info("Seeded desired state from env: model=%s", resolved_env_model)
+        return
 
-    aliases = [
-        ("default", default_model),
-        ("llama-3.1-8b", "meta-llama/Llama-3.1-8B-Instruct"),
-    ]
-    for alias, model_id in aliases:
-        await db.execute(
-            "INSERT OR IGNORE INTO model_aliases (alias, model_id) VALUES (?, ?)",
-            (alias, model_id),
+    stored = await get_desired_state()
+    env_changed = (
+        stored.model != resolved_env_model
+        or stored.context_length != default_context
+        or abs(stored.gpu_utilization - default_util) > 1e-6
+    )
+    if env_changed:
+        sequence_id = await append_intent(
+            "load_model",
+            {
+                "model": default_model,
+                "context_length": default_context,
+                "gpu_utilization": default_util,
+            },
         )
-    await db.commit()
+        logger.info(
+            "Queued model change from .env (sequence_id=%s): %s -> %s",
+            sequence_id,
+            stored.model,
+            resolved_env_model,
+        )
 
 
 async def resolve_model(model_or_alias: str) -> str:

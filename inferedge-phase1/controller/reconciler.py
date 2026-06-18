@@ -25,6 +25,32 @@ logger = logging.getLogger(__name__)
 RECONCILE_INTERVAL = float(os.environ.get("RECONCILE_INTERVAL_SEC", "5"))
 
 
+async def _poll_download_progress(model_id: str, stop: asyncio.Event) -> None:
+    """Update /status while a blocking HF download runs in a worker thread."""
+    while not stop.is_set():
+        stats = await asyncio.to_thread(models.get_cache_stats, model_id)
+        await state.set_appliance_state(
+            ApplianceState.RECONCILING,
+            last_error=(
+                f"Downloading {model_id}: {stats['human']} on disk "
+                f"({stats['weight_files']} weight file(s))"
+                + (f" — {stats['current_file']}" if stats.get("current_file") else "")
+            ),
+            last_reconcile_ts=time.time(),
+            actual=ActualState(
+                health="DOWNLOADING",
+                current_model=model_id,
+                download_bytes=stats["bytes"],
+                download_weight_files=stats["weight_files"],
+                download_current_file=stats.get("current_file"),
+            ),
+        )
+        try:
+            await asyncio.wait_for(stop.wait(), timeout=10.0)
+        except asyncio.TimeoutError:
+            pass
+
+
 class Reconciler:
     def __init__(self, appliance_id: str) -> None:
         self.appliance_id = appliance_id
@@ -88,7 +114,7 @@ class Reconciler:
                     ApplianceState.RECONCILING, last_error=None, last_reconcile_ts=time.time()
                 )
 
-                if not gpu.is_gpu_available():
+                if not await asyncio.to_thread(gpu.is_gpu_available):
                     last_error = "No GPU detected. Appliance running in CPU-only degraded mode."
                     new_state = ApplianceState.DEGRADED
                     actual = await models.get_deployment_status(resolved_model)
@@ -100,8 +126,13 @@ class Reconciler:
                     )
                     return
 
+                stop_progress = asyncio.Event()
+                progress_task = asyncio.create_task(
+                    _poll_download_progress(resolved_model, stop_progress)
+                )
+                model_path = ""
                 try:
-                    models.ensure_artifact(resolved_model)
+                    model_path = await asyncio.to_thread(models.ensure_artifact, resolved_model)
                 except ArtifactError as exc:
                     last_error = str(exc)
                     new_state = ApplianceState.DEGRADED
@@ -116,18 +147,21 @@ class Reconciler:
                         },
                     )
                     return
+                finally:
+                    stop_progress.set()
+                    await progress_task
 
                 next_gen = await state.get_next_generation()
-                stopped = await models.stop_vllm_if_needed(
-                    except_hash=config_hash, except_generation=next_gen - 1
-                )
-                if stopped:
-                    vllm_restarts += stopped
-                    self.total_restarts += stopped
-
                 try:
+                    stopped = await models.stop_vllm_if_needed(
+                        except_hash=config_hash, except_generation=next_gen - 1
+                    )
+                    if stopped:
+                        vllm_restarts += stopped
+                        self.total_restarts += stopped
+
                     container_id = await models.start_or_update_vllm(
-                        resolved_model, desired, config_hash, next_gen
+                        resolved_model, model_path, desired, config_hash, next_gen
                     )
                     logger.info("Started vLLM container %s (generation=%d)", container_id[:12], next_gen)
                 except DockerError as exc:

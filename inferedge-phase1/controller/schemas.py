@@ -29,6 +29,9 @@ class ActualState(BaseModel):
     gpu_ids: Optional[str] = None
     exit_code: Optional[int] = None
     log_snippet: Optional[str] = None
+    download_bytes: Optional[int] = None
+    download_weight_files: Optional[int] = None
+    download_current_file: Optional[str] = None
 
 
 class ApplianceStatus(BaseModel):

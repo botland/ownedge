@@ -54,7 +54,7 @@ services:
       - APPLIANCE_ID=${APPLIANCE_ID}
       - COMPOSE_PROJECT_NAME=${COMPOSE_PROJECT_NAME}
       - SQLITE_DB_PATH=${SQLITE_DB_PATH}
-      - LOCAL_MODEL_CACHE=${LOCAL_MODEL_CACHE}
+      - LOCAL_MODEL_CACHE=/models_cache
       - DEFAULT_MODEL=${DEFAULT_MODEL}
       - DEFAULT_CONTEXT=${DEFAULT_CONTEXT}
       - GPU_UTILIZATION=${GPU_UTILIZATION}
@@ -69,9 +69,12 @@ services:
       - VLLM_CONTAINER_STARTUP_TIMEOUT_SEC=${VLLM_CONTAINER_STARTUP_TIMEOUT_SEC}
       - VLLM_PROBE_TIMEOUT_SEC=${VLLM_PROBE_TIMEOUT_SEC}
       - RECONCILE_INTERVAL_SEC=${RECONCILE_INTERVAL_SEC}
+      - HF_DOWNLOAD_TIMEOUT_SEC=${HF_DOWNLOAD_TIMEOUT_SEC:-7200}
+      - HF_DOWNLOAD_STALL_SEC=${HF_DOWNLOAD_STALL_SEC:-1200}
+      - MIN_FREE_DISK_GB=${MIN_FREE_DISK_GB:-20}
     volumes:
       - controller_data:/data
-      - ${LOCAL_MODEL_CACHE}:/models_cache
+      - ${MODEL_CACHE_HOST:-/var/lib/inferedge/models}:/models_cache
       - /var/run/docker.sock:/var/run/docker.sock:rw
     healthcheck:
       test: ["CMD", "curl", "-sf", "http://localhost:${CONTROLLER_PORT}/status"]

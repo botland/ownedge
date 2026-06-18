@@ -24,7 +24,7 @@ class GpuInfo:
 
 def _via_pynvml() -> GpuInfo:
     try:
-        import pynvml
+        import pynvml  # provided by nvidia-ml-py
 
         pynvml.nvmlInit()
         count = pynvml.nvmlDeviceGetCount()

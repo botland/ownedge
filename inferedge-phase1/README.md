@@ -8,13 +8,14 @@ Single-node inference appliance with a Controller reconciler, label-managed vLLM
 - NVIDIA GPU with ≥8 GB VRAM (≥16 GB recommended)
 - Docker Compose v2
 - [nvidia-container-toolkit](https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/install-guide.html)
-- Optional: Hugging Face token for gated models (`HF_TOKEN`)
+- Hugging Face token (`HF_TOKEN`) — **required** for gated models like `meta-llama/Llama-3.1-8B-Instruct`
 
 ## Quick Start
 
 ```bash
 cp .env.example .env
-# Edit .env: set CONTROLLER_API_TOKEN and HF_TOKEN if needed
+# Edit .env: set CONTROLLER_API_TOKEN and HF_TOKEN (required for Llama)
+# Accept the model license at https://huggingface.co/meta-llama/Llama-3.1-8B-Instruct
 
 docker compose up -d --build
 docker compose logs -f controller
@@ -28,7 +29,20 @@ curl http://localhost:8080/status | jq
 
 `/status` is available immediately on boot (state `BOOT` → `RECONCILING` → `READY`).
 
-## Load a Model
+## Changing the Default Model
+
+Desired state is stored in SQLite and survives reboots. To switch models:
+
+**Option A — edit `.env` (recommended for appliance config)**
+
+```bash
+# Edit DEFAULT_MODEL in .env, then recreate the controller to pick up env vars:
+docker compose up -d --force-recreate controller
+```
+
+On startup the controller compares `.env` to SQLite and queues a `load_model` intent if they differ.
+
+**Option B — runtime API**
 
 Protected endpoint — requires Bearer token when `CONTROLLER_API_TOKEN` is set:
 
@@ -41,7 +55,17 @@ curl -X POST http://localhost:8080/models/load \
 
 Aliases (`llama-3.1-8b`, `default`) resolve via the `model_aliases` SQLite table.
 
+**Option C — reset persisted state**
+
+```bash
+docker compose down
+docker volume rm inferedge_controller_data
+docker compose up -d
+```
+
 ## Inference via LiteLLM
+
+Use **port 80** (Traefik → LiteLLM), not the controller on port 8080.
 
 Once state is `READY`:
 
@@ -118,7 +142,10 @@ Schema version is tracked in `schema_meta`. To add a migration:
 | State | Likely cause | Action |
 |---|---|---|
 | `DEGRADED` + GPU message | No NVIDIA GPU / driver | Install drivers + nvidia-container-toolkit |
-| `DEGRADED` + HF auth | Gated model | Set `HF_TOKEN` in `.env` |
+| `DEGRADED` + HF auth (401) | No/invalid token | Set `HF_TOKEN` in `.env` |
+| `DEGRADED` + HF access denied (403) | Token set, license not accepted | Log into HF as token owner → open model page → click **Agree and access repository** |
 | `DEGRADED` + disk full | Cache volume full | Free space under `LOCAL_MODEL_CACHE` |
 | `FAILED` + Docker error | Daemon / GPU passthrough | Check `docker compose logs controller` and `deployments.log_snippet` in `/status` |
-| `RECONCILING` (long) | First model download | Wait; monitor `docker compose logs controller` |
+| `RECONCILING` (long) | First model download | Check `curl localhost:8080/status` for `download_bytes`; files appear under `MODEL_CACHE_HOST` on host |
+| Empty `MODEL_CACHE_HOST` during download | Cache path bug (old builds) | Rebuild controller; ensure compose sets `LOCAL_MODEL_CACHE=/models_cache` inside container |
+| `POST /v1/chat/completions` 404 on :8080 | Wrong port | Use `http://localhost/v1/...` (port 80), not the controller API |
