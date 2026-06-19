@@ -9,6 +9,8 @@ import hashlib
 import json
 import logging
 import os
+import re
+import threading
 import time
 from typing import Optional
 
@@ -16,9 +18,16 @@ import docker
 import httpx
 from docker.errors import DockerException
 from docker.types import DeviceRequest
+from huggingface_hub.errors import GatedRepoError, HfHubHTTPError
 
 import state
-from exceptions import ArtifactError, DockerError, ProbeTimeoutError
+from exceptions import (
+    ArtifactError,
+    DockerError,
+    ProbeTimeoutError,
+    TransientArtifactError,
+    TransientDockerError,
+)
 from gpu import get_gpu_uuids
 from schemas import ActualState, DesiredState
 
@@ -43,12 +52,20 @@ VLLM_PORT = int(os.environ.get("VLLM_INTERNAL_PORT", "8000"))
 CACHE_DIR = os.environ.get("LOCAL_MODEL_CACHE", "/models_cache")
 HF_TOKEN = os.environ.get("HF_TOKEN", "")
 HF_DOWNLOAD_TIMEOUT = int(os.environ.get("HF_DOWNLOAD_TIMEOUT_SEC", "7200"))
-HF_DOWNLOAD_STALL_SEC = int(os.environ.get("HF_DOWNLOAD_STALL_SEC", "1200"))
+HF_DOWNLOAD_STALL_SEC = int(os.environ.get("HF_DOWNLOAD_STALL_SEC", "3600"))
+HF_API_TIMEOUT = float(os.environ.get("HF_API_TIMEOUT_SEC", "60"))
 MIN_FREE_DISK_GB = float(os.environ.get("MIN_FREE_DISK_GB", "20"))
+DOWNLOAD_CONNECTIONS = int(os.environ.get("DOWNLOAD_CONNECTIONS", "16"))
+_HF_INTERNAL_DIRS = frozenset({".hf_home", ".cache"})
+PARALLEL_DOWNLOAD_MIN_BYTES = 50 * 1024 * 1024
 CONTAINER_STARTUP_TIMEOUT = int(os.environ.get("VLLM_CONTAINER_STARTUP_TIMEOUT_SEC", "120"))
 PROBE_TIMEOUT = int(os.environ.get("VLLM_PROBE_TIMEOUT_SEC", "600"))
+VLLM_IMAGE_PULL_TIMEOUT = int(os.environ.get("VLLM_IMAGE_PULL_TIMEOUT_SEC", "3600"))
+VLLM_IMAGE_PULL_STALL_SEC = int(os.environ.get("VLLM_IMAGE_PULL_STALL_SEC", "300"))
+VLLM_SHM_SIZE = int(float(os.environ.get("VLLM_SHM_SIZE_GB", "4")) * 1024**3)
 
 _docker_client: docker.DockerClient | None = None
+_vllm_op_lock = threading.Lock()
 
 
 def _get_client() -> docker.DockerClient:
@@ -150,7 +167,7 @@ def get_cache_stats(model_id: str, cache_dir: str = CACHE_DIR) -> dict:
         except OSError:
             pass
     if os.path.isdir(target):
-        for root, _, files in os.walk(target):
+        for root, files in _walk_model_files(target):
             for name in files:
                 if name == ".inferedge-download-progress":
                     continue
@@ -160,7 +177,9 @@ def get_cache_stats(model_id: str, cache_dir: str = CACHE_DIR) -> dict:
                 except OSError:
                     continue
                 total_bytes += size
-                if name.endswith(WEIGHT_SUFFIXES) and ".incomplete" not in name:
+                if name.endswith(WEIGHT_SUFFIXES) and ".incomplete" not in name and not name.endswith(
+                    ".part"
+                ):
                     weight_files += 1
     return {
         "path": target,
@@ -171,13 +190,60 @@ def get_cache_stats(model_id: str, cache_dir: str = CACHE_DIR) -> dict:
     }
 
 
+_SHARD_RE = re.compile(r"^(.+)-(\d+)-of-(\d+)(\.[^.]+)$")
+
+
+def _walk_model_files(target: str):
+    """Walk model cache files, skipping legacy HF hub metadata dirs."""
+    for root, dirs, files in os.walk(target):
+        dirs[:] = [d for d in dirs if d not in _HF_INTERNAL_DIRS]
+        yield root, files
+
+
 def _cache_has_weights(target: str) -> bool:
+    """True only when all expected weight shards/files are present (not partial)."""
     if not os.path.isdir(target):
         return False
-    for root, _, files in os.walk(target):
+
+    shard_groups: dict[str, dict[str, int | set[int]]] = {}
+    for root, files in _walk_model_files(target):
         for name in files:
+            if name.endswith(".part") or ".incomplete" in name:
+                continue
+            match = _SHARD_RE.match(name)
+            if not match:
+                continue
+            prefix, index_s, total_s, _suffix = match.groups()
+            key = f"{prefix}-of-{total_s}"
+            group = shard_groups.setdefault(key, {"total": int(total_s), "indices": set()})
+            try:
+                if os.path.getsize(os.path.join(root, name)) <= 0:
+                    continue
+            except OSError:
+                continue
+            group["indices"].add(int(index_s))
+
+    if shard_groups:
+        complete = [g for g in shard_groups.values() if len(g["indices"]) == g["total"]]
+        if complete:
+            return True
+        logger.warning(
+            "Incomplete shard set under %s: %s",
+            target,
+            {k: (len(v["indices"]), v["total"]) for k, v in shard_groups.items()},
+        )
+        return False
+
+    for root, files in _walk_model_files(target):
+        for name in files:
+            if name.endswith(".part") or ".incomplete" in name:
+                continue
             if name.endswith(WEIGHT_SUFFIXES):
-                return True
+                try:
+                    if os.path.getsize(os.path.join(root, name)) > 0:
+                        return True
+                except OSError:
+                    continue
     return False
 
 
@@ -189,8 +255,6 @@ def _clear_cache_dir(target: str) -> None:
 
 
 def _raise_for_hf_http(model_id: str, exc: Exception) -> None:
-    from huggingface_hub.errors import GatedRepoError, HfHubHTTPError
-
     if isinstance(exc, GatedRepoError):
         raise (_hf_license_error(model_id) if HF_TOKEN else _hf_auth_error(model_id)) from exc
     if isinstance(exc, HfHubHTTPError) and exc.response is not None:
@@ -213,7 +277,11 @@ def _list_repo_files(model_id: str) -> list[str]:
     from huggingface_hub import HfApi
 
     api = HfApi(token=HF_TOKEN or None)
-    return [f for f in api.list_repo_files(model_id) if _should_download_file(f)]
+    try:
+        files = api.list_repo_files(model_id, timeout=HF_API_TIMEOUT)
+    except TypeError:
+        files = api.list_repo_files(model_id)
+    return [f for f in files if _should_download_file(f)]
 
 
 def _check_disk_space(cache_dir: str) -> None:
@@ -228,6 +296,106 @@ def _check_disk_space(cache_dir: str) -> None:
         )
 
 
+def _configure_hf_download_env(target: str) -> None:
+    """Force classic HTTP downloads — XET buffers silently and appears stuck in Docker."""
+    os.environ["HF_HUB_DISABLE_XET"] = "1"
+    os.environ.pop("HF_HUB_ENABLE_HF_TRANSFER", None)
+    hf_home = os.path.join(target, ".hf_home")
+    os.makedirs(hf_home, exist_ok=True)
+    os.environ["HF_HOME"] = hf_home
+    os.environ["HUGGINGFACE_HUB_CACHE"] = os.path.join(hf_home, "hub")
+
+
+def heal_download_environment(target: str) -> None:
+    """Auto-heal wedged HF downloads: locks, XET staging, zero-byte incomplete files."""
+    locks = _cleanup_hf_locks(target)
+    xet_dir = os.path.join(target, ".hf_home", "xet")
+    if os.path.isdir(xet_dir):
+        import shutil
+
+        shutil.rmtree(xet_dir, ignore_errors=True)
+        logger.info("Auto-heal: cleared HF XET staging at %s", xet_dir)
+    removed_incomplete = 0
+    removed_corrupt = 0
+    if os.path.isdir(target):
+        for root, files in _walk_model_files(target):
+            for name in files:
+                path = os.path.join(root, name)
+                if ".incomplete" in name:
+                    try:
+                        if os.path.getsize(path) == 0:
+                            os.remove(path)
+                            removed_incomplete += 1
+                    except OSError:
+                        pass
+                    continue
+                if name == ".inferedge-download-progress":
+                    continue
+                rel = os.path.relpath(path, target)
+                if _remove_if_corrupt(path, rel):
+                    removed_corrupt += 1
+    if locks or removed_incomplete or removed_corrupt:
+        logger.info(
+            "Auto-heal: removed %d lock(s), %d empty incomplete file(s), "
+            "%d corrupt file(s) under %s",
+            locks,
+            removed_incomplete,
+            removed_corrupt,
+            target,
+        )
+
+
+def _cleanup_hf_locks(target: str) -> int:
+    """Remove stale HF download locks that block resume after a crashed download."""
+    removed = 0
+    for sub in (
+        os.path.join(target, ".cache", "huggingface", "download"),
+        os.path.join(target, ".hf_home", "hub"),
+    ):
+        if not os.path.isdir(sub):
+            continue
+        for root, _, files in os.walk(sub):
+            for name in files:
+                if not name.endswith(".lock"):
+                    continue
+                path = os.path.join(root, name)
+                try:
+                    os.remove(path)
+                    removed += 1
+                    logger.warning("Removed HF download lock: %s", path)
+                except OSError:
+                    pass
+    return removed
+
+
+def _snapshot_download_sizes(target: str) -> dict[str, int]:
+    """Track in-progress bytes (.part and .incomplete files)."""
+    sizes: dict[str, int] = {}
+    if not os.path.isdir(target):
+        return sizes
+    for root, _, files in os.walk(target):
+        for name in files:
+            if (
+                ".incomplete" not in name
+                and not name.endswith(".part")
+                and not name.endswith(".aria2")
+            ):
+                continue
+            path = os.path.join(root, name)
+            try:
+                sizes[path] = os.path.getsize(path)
+            except OSError:
+                pass
+    return sizes
+
+
+def _download_sizes_grew(before: dict[str, int], after: dict[str, int]) -> bool:
+    for path, size in after.items():
+        if size > before.get(path, 0) + 64 * 1024:
+            return True
+    return len(after) > len(before)
+
+
 def _write_download_progress(target: str, message: str) -> None:
     try:
         with open(os.path.join(target, ".inferedge-download-progress"), "w", encoding="utf-8") as f:
@@ -236,16 +404,256 @@ def _write_download_progress(target: str, message: str) -> None:
         pass
 
 
-def _download_all_files(model_id: str, target: str) -> None:
-    """Download HF repo files one at a time (runs in subprocess for killability)."""
-    from huggingface_hub import hf_hub_download
-    from huggingface_hub.errors import GatedRepoError, HfHubHTTPError
+def _is_metadata_file(filename: str) -> bool:
+    lower = filename.lower()
+    return filename.endswith((".json", ".txt", ".jinja", ".model")) or "tokenizer" in lower
 
-    # Keep HF hub cache on the model volume so partial downloads are visible in /status
-    hf_home = os.path.join(target, ".hf_home")
-    os.makedirs(hf_home, exist_ok=True)
-    os.environ["HF_HOME"] = hf_home
-    os.environ["HUGGINGFACE_HUB_CACHE"] = os.path.join(hf_home, "hub")
+
+def _file_looks_corrupt(filename: str, size: int) -> bool:
+    """Detect files polluted by wrong cross-file resume (e.g. 575 MB tokenizer.json)."""
+    if size <= 0:
+        return True
+    if filename.endswith(WEIGHT_SUFFIXES):
+        return False
+    if _is_metadata_file(filename):
+        return size > 50 * 1024 * 1024
+    return False
+
+
+def _remove_if_corrupt(path: str, filename: str) -> bool:
+    """Delete path when it looks like a mismatched partial resume. Returns True if removed."""
+    try:
+        size = os.path.getsize(path)
+    except OSError:
+        return False
+    if not _file_looks_corrupt(filename, size):
+        return False
+    try:
+        os.remove(path)
+        logger.warning(
+            "Removed corrupt cached %s (%s) — will re-download",
+            filename,
+            _format_bytes(size),
+        )
+        return True
+    except OSError:
+        return False
+
+
+def _bootstrap_part_from_legacy(target: str, filename: str, part: str) -> int:
+    """Migrate partial bytes from a file-specific HF .incomplete cache into .part."""
+    if os.path.isfile(part):
+        size = os.path.getsize(part)
+        if _file_looks_corrupt(filename, size):
+            os.remove(part)
+            return 0
+        return size
+
+    dest = os.path.join(target, filename)
+    basename = os.path.basename(filename)
+    dest_dir = os.path.dirname(dest) or target
+    best_size = 0
+    best_path: str | None = None
+    for root, _, files in os.walk(target):
+        for name in files:
+            if ".incomplete" not in name:
+                continue
+            if not (name == f"{basename}.incomplete" or name.startswith(f"{basename}.")):
+                continue
+            if os.path.join(root, name) == part:
+                continue
+            path = os.path.join(root, name)
+            if os.path.dirname(path) != dest_dir:
+                continue
+            try:
+                size = os.path.getsize(path)
+            except OSError:
+                continue
+            if size > best_size:
+                best_size = size
+                best_path = path
+    if best_path and best_size > 0:
+        if _file_looks_corrupt(filename, best_size):
+            return 0
+        import shutil
+
+        shutil.copy2(best_path, part)
+        logger.info(
+            "Resumed from legacy HF partial cache (%s) for %s",
+            _format_bytes(best_size),
+            filename,
+        )
+        return best_size
+    return 0
+
+
+def _prepare_resume_file(dest: str, part: str, target: str, filename: str) -> None:
+    """Merge .part / legacy incomplete into dest so aria2/HTTP can resume."""
+    if os.path.isfile(dest) and os.path.getsize(dest) > 0:
+        _remove_if_corrupt(dest, filename)
+        if os.path.isfile(dest):
+            return
+    if os.path.isfile(part):
+        os.replace(part, dest)
+        logger.info(
+            "Continuing partial download %s (%s)",
+            filename,
+            _format_bytes(os.path.getsize(dest)),
+        )
+        return
+    _bootstrap_part_from_legacy(target, filename, part)
+    if os.path.isfile(part) and os.path.getsize(part) > 0:
+        os.replace(part, dest)
+        logger.info(
+            "Continuing partial download %s (%s)",
+            filename,
+            _format_bytes(os.path.getsize(dest)),
+        )
+
+
+def _download_file_aria2(model_id: str, filename: str, target: str) -> None:
+    """Multi-connection download for large shards (much faster than single HTTP stream)."""
+    import subprocess
+
+    dest = os.path.join(target, filename)
+    part = dest + ".part"
+    os.makedirs(os.path.dirname(dest) or target, exist_ok=True)
+
+    if os.path.isfile(dest) and os.path.getsize(dest) > 0:
+        _remove_if_corrupt(dest, filename)
+        if os.path.isfile(dest):
+            return
+
+    _prepare_resume_file(dest, part, target, filename)
+
+    url = f"https://huggingface.co/{model_id}/resolve/main/{filename}"
+    conns = str(DOWNLOAD_CONNECTIONS)
+    cmd = [
+        "aria2c",
+        "-x",
+        conns,
+        "-s",
+        conns,
+        "-k",
+        "4M",
+        "--file-allocation=none",
+        "--continue=true",
+        "--allow-overwrite=true",
+        f"--max-connection-per-server={conns}",
+        "--summary-interval=30",
+        "-d",
+        os.path.dirname(dest) or target,
+        "-o",
+        os.path.basename(dest),
+    ]
+    if HF_TOKEN:
+        cmd.append(f"--header=Authorization: Bearer {HF_TOKEN}")
+    cmd.append(url)
+
+    logger.info("Parallel download %s (%s connections)", filename, conns)
+    try:
+        subprocess.run(
+            cmd,
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise TransientArtifactError(f"aria2 timed out on {filename}") from exc
+    except subprocess.CalledProcessError as exc:
+        stderr = (exc.stderr or "")[-500:]
+        raise TransientArtifactError(f"aria2 failed on {filename}: {stderr}") from exc
+
+    logger.info("Completed %s (%s)", filename, _format_bytes(os.path.getsize(dest)))
+
+
+def _download_file(model_id: str, filename: str, target: str) -> None:
+    if filename.endswith(".safetensors"):
+        _download_file_aria2(model_id, filename, target)
+    else:
+        _download_file_streaming(model_id, filename, target)
+
+
+def _download_file_streaming(model_id: str, filename: str, target: str) -> None:
+    """Stream download to <target>/<filename>.part with HTTP Range resume."""
+    import httpx
+
+    dest = os.path.join(target, filename)
+    part = dest + ".part"
+    os.makedirs(os.path.dirname(dest) or target, exist_ok=True)
+
+    if os.path.isfile(dest) and os.path.getsize(dest) > 0:
+        _remove_if_corrupt(dest, filename)
+        if os.path.isfile(dest):
+            return
+
+    offset = _bootstrap_part_from_legacy(target, filename, part)
+    url = f"https://huggingface.co/{model_id}/resolve/main/{filename}"
+    headers: dict[str, str] = {}
+    if HF_TOKEN:
+        headers["Authorization"] = f"Bearer {HF_TOKEN}"
+
+    timeout = httpx.Timeout(60.0, read=900.0)
+    try:
+        with httpx.Client(follow_redirects=True, timeout=timeout) as client:
+            for attempt in range(2):
+                req_headers = dict(headers)
+                if offset > 0:
+                    req_headers["Range"] = f"bytes={offset}-"
+                    logger.info("Resuming %s from %s", filename, _format_bytes(offset))
+
+                last_log = offset
+                with client.stream("GET", url, headers=req_headers) as response:
+                    if response.status_code == 416:
+                        logger.warning(
+                            "Range resume invalid for %s at %s; restarting download",
+                            filename,
+                            _format_bytes(offset),
+                        )
+                        for path in (part, dest):
+                            if os.path.isfile(path):
+                                os.remove(path)
+                        offset = 0
+                        continue
+                    if response.status_code not in (200, 206):
+                        raise TransientArtifactError(
+                            f"HTTP {response.status_code} downloading {filename}"
+                        )
+
+                    mode = "wb"
+                    downloaded = 0
+                    if response.status_code == 206 and offset > 0:
+                        mode = "ab"
+                        downloaded = offset
+                    else:
+                        offset = 0
+
+                    with open(part, mode) as out:
+                        for chunk in response.iter_bytes(chunk_size=1024 * 1024):
+                            out.write(chunk)
+                            downloaded += len(chunk)
+                            if downloaded - last_log >= 100 * 1024 * 1024:
+                                logger.info(
+                                    "Progress %s: %s", filename, _format_bytes(downloaded)
+                                )
+                                last_log = downloaded
+                break
+            else:
+                raise TransientArtifactError(
+                    f"HTTP 416 downloading {filename} after resume reset"
+                )
+    except httpx.HTTPError as exc:
+        raise TransientArtifactError(f"Network error downloading {filename}") from exc
+
+    os.replace(part, dest)
+    logger.info("Completed %s (%s)", filename, _format_bytes(os.path.getsize(dest)))
+
+
+def _download_all_files(model_id: str, target: str) -> None:
+    """Download HF repo files one at a time (runs in spawn subprocess)."""
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+    _configure_hf_download_env(target)
+    heal_download_environment(target)
 
     files = _list_repo_files(model_id)
     if not files:
@@ -254,18 +662,21 @@ def _download_all_files(model_id: str, target: str) -> None:
     os.makedirs(target, exist_ok=True)
     total = len(files)
     for idx, filename in enumerate(files, 1):
+        dest = os.path.join(target, filename)
+        if os.path.isfile(dest) and os.path.getsize(dest) > 0:
+            if _remove_if_corrupt(dest, filename):
+                pass
+            else:
+                logger.info(
+                    "Skipping existing %s (%s)", filename, _format_bytes(os.path.getsize(dest))
+                )
+                continue
+
         progress = f"[{idx}/{total}] {filename}"
         _write_download_progress(target, progress)
         logger.info("Downloading %s %s", model_id, progress)
         try:
-            hf_hub_download(
-                repo_id=model_id,
-                filename=filename,
-                local_dir=target,
-                token=HF_TOKEN or None,
-            )
-        except (GatedRepoError, HfHubHTTPError) as exc:
-            _raise_for_hf_http(model_id, exc)
+            _download_file(model_id, filename, target)
         except Exception as exc:
             err_file = os.path.join(target, ".inferedge-download-error")
             try:
@@ -281,35 +692,54 @@ def _run_download_with_watchdog(model_id: str, target: str, cache_dir: str) -> N
     """Run download in a child process; kill on timeout or stall."""
     import multiprocessing as mp
 
-    ctx = mp.get_context("fork")
+    ctx = mp.get_context("spawn")
     proc = ctx.Process(target=_download_all_files, args=(model_id, target), daemon=True)
     proc.start()
 
     last_bytes = 0
     last_progress = None
+    last_partial = _snapshot_download_sizes(target)
     stall_since = time.monotonic()
-    deadline = time.monotonic() + HF_DOWNLOAD_TIMEOUT
+    idle_deadline = time.monotonic() + HF_DOWNLOAD_TIMEOUT
 
     while proc.is_alive():
-        if time.monotonic() > deadline:
-            proc.terminate()
-            proc.join(timeout=15)
-            raise ArtifactError(
-                f"Download timed out after {HF_DOWNLOAD_TIMEOUT}s for {model_id}"
-            )
-
         stats = get_cache_stats(model_id, cache_dir)
         progress = stats.get("current_file")
-        if stats["bytes"] > last_bytes + 256 * 1024 or progress != last_progress:
+        if progress == "complete":
+            proc.join(timeout=30)
+            if not proc.is_alive():
+                break
+            logger.warning("Download subprocess hung after marking complete; terminating")
+            proc.terminate()
+            proc.join(timeout=15)
+            break
+        partial = _snapshot_download_sizes(target)
+        made_progress = (
+            stats["bytes"] > last_bytes + 256 * 1024
+            or progress != last_progress
+            or _download_sizes_grew(last_partial, partial)
+        )
+        if made_progress:
             last_bytes = stats["bytes"]
             last_progress = progress
+            last_partial = partial
             stall_since = time.monotonic()
+            idle_deadline = time.monotonic() + HF_DOWNLOAD_TIMEOUT
+        elif time.monotonic() > idle_deadline:
+            proc.terminate()
+            proc.join(timeout=15)
+            heal_download_environment(target)
+            raise TransientArtifactError(
+                f"Download idle for {HF_DOWNLOAD_TIMEOUT}s at {stats['human']} "
+                f"({progress or 'unknown file'}) for {model_id}; retrying"
+            )
         elif time.monotonic() - stall_since > HF_DOWNLOAD_STALL_SEC:
             proc.terminate()
             proc.join(timeout=15)
-            raise ArtifactError(
+            heal_download_environment(target)
+            raise TransientArtifactError(
                 f"Download stalled for {HF_DOWNLOAD_STALL_SEC}s at {stats['human']} "
-                f"({progress or 'unknown file'}). Check network and disk at {stats['path']}"
+                f"({progress or 'unknown file'}); auto-heal applied, retrying"
             )
 
         proc.join(timeout=10)
@@ -322,39 +752,69 @@ def _run_download_with_watchdog(model_id: str, target: str, cache_dir: str) -> N
                 detail = open(err_file, encoding="utf-8").read().strip()
             except OSError:
                 pass
+        stats = get_cache_stats(model_id, cache_dir)
+        heal_download_environment(target)
+        if stats["bytes"] > 10_000_000:
+            raise TransientArtifactError(
+                f"Download interrupted for {model_id} ({stats['human']} cached); retrying"
+            ) from None
         raise ArtifactError(f"Download failed for {model_id}: {detail}")
 
 
 def _verify_hf_access(model_id: str) -> None:
     """Fail fast before a long snapshot_download when token/license is wrong."""
     from huggingface_hub import HfApi
-    from huggingface_hub.errors import GatedRepoError, HfHubHTTPError
 
     if not HF_TOKEN and _is_likely_gated(model_id):
         raise _hf_auth_error(model_id)
 
     api = HfApi(token=HF_TOKEN or None)
     try:
-        api.model_info(model_id)
+        try:
+            api.model_info(model_id, timeout=HF_API_TIMEOUT)
+        except TypeError:
+            api.model_info(model_id)
     except (GatedRepoError, HfHubHTTPError) as exc:
         _raise_for_hf_http(model_id, exc)
+
+
+def _download_marked_complete(target: str) -> bool:
+    progress_path = os.path.join(target, ".inferedge-download-progress")
+    if not os.path.isfile(progress_path):
+        return False
+    try:
+        with open(progress_path, encoding="utf-8") as progress_f:
+            return progress_f.read().strip() == "complete"
+    except OSError:
+        return False
 
 
 def ensure_artifact(model_id: str, cache_dir: str = CACHE_DIR) -> str:
     model_key = normalize_model_key(model_id)
     target = os.path.join(cache_dir, model_key)
     if _cache_has_weights(target):
+        logger.info("Model cache ready for %s at %s", model_id, target)
         return target
 
     if os.path.isdir(target):
-        logger.warning("Removing incomplete model cache at %s", target)
-        _clear_cache_dir(target)
+        stats = get_cache_stats(model_id, cache_dir)
+        if stats["bytes"] < 10_000_000:
+            logger.warning("Removing tiny/broken cache at %s (%s)", target, stats["human"])
+            _clear_cache_dir(target)
+        else:
+            logger.info("Resuming partial download at %s (%s)", target, stats["human"])
+            heal_download_environment(target)
+            if _download_marked_complete(target) and stats["weight_files"] > 0:
+                raise ArtifactError(
+                    f"Download marked complete for {model_id} but weight validation failed. "
+                    f"Remove {target} or delete stale .hf_home metadata and retry."
+                )
 
     _verify_hf_access(model_id)
     _check_disk_space(cache_dir)
     os.makedirs(cache_dir, exist_ok=True)
     logger.info(
-        "Downloading %s to %s (timeout=%ss, stall=%ss)",
+        "Downloading %s to %s (idle_timeout=%ss, stall=%ss)",
         model_id,
         target,
         HF_DOWNLOAD_TIMEOUT,
@@ -378,6 +838,12 @@ def ensure_artifact(model_id: str, cache_dir: str = CACHE_DIR) -> str:
                 f"Check HF_TOKEN and license access at https://huggingface.co/{model_id}"
             )
         return target
+    except ArtifactError as exc:
+        if isinstance(exc, TransientArtifactError):
+            heal_download_environment(target)
+            raise
+        _clear_cache_dir(target)
+        raise
     except (GatedRepoError, HfHubHTTPError) as exc:
         _clear_cache_dir(target)
         _raise_for_hf_http(model_id, exc)
@@ -387,9 +853,6 @@ def ensure_artifact(model_id: str, cache_dir: str = CACHE_DIR) -> str:
                 f"Disk full while downloading {model_id}. Free space under {cache_dir}."
             ) from exc
         raise ArtifactError(f"Filesystem error downloading {model_id}: {exc}") from exc
-    except ArtifactError:
-        _clear_cache_dir(target)
-        raise
     except Exception as exc:
         _clear_cache_dir(target)
         msg = str(exc).lower()
@@ -398,7 +861,8 @@ def ensure_artifact(model_id: str, cache_dir: str = CACHE_DIR) -> str:
         if "403" in msg or "forbidden" in msg or "gated" in msg:
             raise (_hf_license_error(model_id) if HF_TOKEN else _hf_auth_error(model_id)) from exc
         if "connection" in msg or "timeout" in msg or "network" in msg:
-            raise ArtifactError(f"Network error downloading {model_id}: {exc}") from exc
+            heal_download_environment(target)
+            raise TransientArtifactError(f"Network error downloading {model_id}; retrying") from exc
         raise ArtifactError(f"Failed to download {model_id}: {exc}") from exc
 
 
@@ -464,6 +928,140 @@ async def stop_vllm_if_needed(
     return stopped
 
 
+def _vllm_image_present(client: docker.DockerClient) -> bool:
+    try:
+        client.images.get(VLLM_IMAGE)
+        return True
+    except docker.errors.ImageNotFound:
+        return False
+
+
+def _pull_vllm_image_worker(image: str, pull_stall_sec: int) -> None:
+    """Pull vLLM image in an isolated subprocess (killable on timeout/stall)."""
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+    client = docker.from_env()
+    logger.info("Pulling vLLM image %s", image)
+    last_activity = time.monotonic()
+    try:
+        for line in client.api.pull(image, stream=True, decode=True):
+            now = time.monotonic()
+            if now - last_activity > pull_stall_sec:
+                raise RuntimeError(f"Stalled pulling {image} for {pull_stall_sec}s")
+            status = line.get("status") or ""
+            layer_id = line.get("id") or ""
+            progress = line.get("progress") or ""
+            error = line.get("error")
+            if error:
+                raise RuntimeError(f"Failed to pull {image}: {error}")
+            if status in {
+                "Pulling fs layer",
+                "Downloading",
+                "Extracting",
+                "Download complete",
+                "Pull complete",
+                "Waiting",
+                "Pulling from",
+            }:
+                last_activity = now
+                if progress or layer_id:
+                    logger.info("vLLM pull %s: %s %s", layer_id, status, progress)
+                else:
+                    logger.info("vLLM pull: %s", status)
+    except DockerException as exc:
+        raise RuntimeError(f"Failed to pull {image}: {exc}") from exc
+    client.images.get(image)
+    logger.info("vLLM image pull finished: %s", image)
+
+
+def _run_vllm_image_pull_watchdog() -> None:
+    """Run image pull in a child process; kill on timeout or stall."""
+    import multiprocessing as mp
+
+    client = _get_client()
+    if _vllm_image_present(client):
+        logger.info("vLLM image present: %s", VLLM_IMAGE)
+        return
+
+    logger.info(
+        "Pulling vLLM image %s (timeout=%ss, stall=%ss)",
+        VLLM_IMAGE,
+        VLLM_IMAGE_PULL_TIMEOUT,
+        VLLM_IMAGE_PULL_STALL_SEC,
+    )
+    ctx = mp.get_context("spawn")
+    proc = ctx.Process(
+        target=_pull_vllm_image_worker,
+        args=(VLLM_IMAGE, VLLM_IMAGE_PULL_STALL_SEC),
+        daemon=True,
+    )
+    proc.start()
+    deadline = time.monotonic() + VLLM_IMAGE_PULL_TIMEOUT
+    while proc.is_alive():
+        if time.monotonic() > deadline:
+            proc.terminate()
+            proc.join(timeout=15)
+            raise TransientDockerError(
+                f"Timed out pulling {VLLM_IMAGE} after {VLLM_IMAGE_PULL_TIMEOUT}s"
+            )
+        proc.join(timeout=10)
+    if proc.exitcode != 0:
+        raise TransientDockerError(f"vLLM image pull failed for {VLLM_IMAGE} (exit {proc.exitcode})")
+
+
+def _ensure_vllm_image(client: docker.DockerClient) -> None:
+    """Pull vLLM image with visible progress — containers.run() pulls silently otherwise."""
+    if _vllm_image_present(client):
+        return
+    _run_vllm_image_pull_watchdog()
+    if not _vllm_image_present(client):
+        raise TransientDockerError(f"vLLM image {VLLM_IMAGE} missing after pull")
+
+
+def prewarm_vllm_image() -> None:
+    """Background pull so first reconcile does not block on a silent image fetch."""
+    try:
+        _ensure_vllm_image(_get_client())
+    except TransientDockerError as exc:
+        logger.warning("vLLM image prewarm incomplete (will retry): %s", exc)
+
+
+def heal_deployment_environment(force_restart_running: bool = False) -> list[str]:
+    """Auto-heal wedged vLLM containers blocking the next reconcile attempt."""
+    actions: list[str] = []
+    client = _get_client()
+    for container in find_managed_vllm_containers():
+        status = container.status
+        if status == "running" and not force_restart_running:
+            continue
+        name = (container.name or container.id[:12]).lstrip("/")
+        try:
+            if status == "running":
+                container.stop(timeout=15)
+            container.remove(force=True)
+            actions.append(f"removed {name} ({status})")
+        except DockerException as exc:
+            actions.append(f"failed to remove {name}: {exc}")
+
+    for container in client.containers.list(all=True):
+        name = (container.name or "").lstrip("/")
+        if not name.startswith("inferedge-vllm-gen"):
+            continue
+        labels = container.labels or {}
+        if labels.get(MANAGED_LABEL) == "true":
+            continue
+        try:
+            if container.status == "running":
+                container.stop(timeout=15)
+            container.remove(force=True)
+            actions.append(f"removed orphan {name}")
+        except DockerException as exc:
+            actions.append(f"failed to remove orphan {name}: {exc}")
+
+    if actions:
+        logger.info("Auto-heal deployment: %s", "; ".join(actions))
+    return actions
+
+
 def _start_or_update_vllm_sync(
     model_id: str,
     model_path: str,
@@ -471,7 +1069,25 @@ def _start_or_update_vllm_sync(
     config_hash: str,
     generation: int,
 ) -> tuple[str, Optional[dict]]:
+    if not _vllm_op_lock.acquire(blocking=False):
+        raise TransientDockerError("vLLM start already in progress; will retry")
+    try:
+        return _start_or_update_vllm_sync_locked(
+            model_id, model_path, desired, config_hash, generation
+        )
+    finally:
+        _vllm_op_lock.release()
+
+
+def _start_or_update_vllm_sync_locked(
+    model_id: str,
+    model_path: str,
+    desired: DesiredState,
+    config_hash: str,
+    generation: int,
+) -> tuple[str, Optional[dict]]:
     model_key = normalize_model_key(model_id)
+    logger.info("Starting vLLM for %s (generation=%d)", model_id, generation)
     gpu_ids = get_gpu_uuids()
     labels = _build_labels(model_key, config_hash, generation, gpu_ids)
 
@@ -482,9 +1098,11 @@ def _start_or_update_vllm_sync(
             and int(cl.get(GENERATION_LABEL, "0")) == generation
             and container.status == "running"
         ):
+            logger.info("Reusing running vLLM container %s", container.id[:12])
             return container.id, None
 
     client = _get_client()
+    _ensure_vllm_image(client)
     env = {"HF_TOKEN": HF_TOKEN} if HF_TOKEN else {}
     command = [
         "vllm",
@@ -504,6 +1122,12 @@ def _start_or_update_vllm_sync(
         DeviceRequest(count=-1, capabilities=[["gpu"]]),
     ]
 
+    logger.info(
+        "Creating vLLM container %s on network %s (shm=%s)",
+        f"inferedge-vllm-gen{generation}",
+        DOCKER_NETWORK,
+        _format_bytes(VLLM_SHM_SIZE),
+    )
     try:
         container = client.containers.run(
             VLLM_IMAGE,
@@ -516,6 +1140,7 @@ def _start_or_update_vllm_sync(
             network=DOCKER_NETWORK,
             name=f"inferedge-vllm-gen{generation}",
             remove=False,
+            shm_size=VLLM_SHM_SIZE,
         )
         network = client.networks.get(DOCKER_NETWORK)
         try:

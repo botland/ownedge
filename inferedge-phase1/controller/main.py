@@ -12,6 +12,9 @@ Layering Rules
 
 import logging
 import os
+
+# Must be set before huggingface_hub is imported anywhere in this process.
+os.environ["HF_HUB_DISABLE_XET"] = "1"
 from contextlib import asynccontextmanager
 from typing import Optional
 

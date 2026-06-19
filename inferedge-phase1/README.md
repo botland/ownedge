@@ -29,6 +29,20 @@ curl http://localhost:8080/status | jq
 
 `/status` is available immediately on boot (state `BOOT` → `RECONCILING` → `READY`).
 
+## Auto-Healing Behavior
+
+The reconciler retries automatically every `RECONCILE_INTERVAL_SEC` (default 5s). You should **not** need to manually clear locks or cache for transient issues.
+
+| Failure type | State | What happens |
+|---|---|---|
+| Download stall / timeout / network blip | `RECONCILING` | Clears HF locks + XET staging, resumes partial cache, retries |
+| HF auth / license (401/403) | `DEGRADED` | Stops — fix `HF_TOKEN` or accept model license |
+| Disk full | `DEGRADED` | Stops — free space under `MODEL_CACHE_HOST` |
+| vLLM crash / Docker error | `FAILED` → retry | Next cycle recreates container |
+| No GPU | `DEGRADED` | Expected CPU-only mode |
+
+Watch auto-retry in logs: `Transient download issue (will retry)` or `/status` with `last_error: "Auto-retry: ..."`.
+
 ## Changing the Default Model
 
 Desired state is stored in SQLite and survives reboots. To switch models:
@@ -116,6 +130,9 @@ On unexpected exit, the last ~200 log lines and exit code are stored in `deploym
 | `VLLM_CONTAINER_STARTUP_TIMEOUT_SEC` | 120 | Container running-state timeout |
 | `VLLM_PROBE_TIMEOUT_SEC` | 600 | `/health` + `/v1/models` probe timeout |
 | `RECONCILE_INTERVAL_SEC` | 5 | Reconciler loop interval |
+| `DOWNLOAD_CONNECTIONS` | 16 | Parallel HTTP connections per shard (aria2) |
+
+Large model shards use **aria2** multi-connection download. Set `HF_TOKEN` for higher Hugging Face rate limits. At ~50 KB/s single-stream, a 2 GB shard takes ~11 hours; 16 connections typically reach much higher throughput.
 
 ## Schema Migrations
 
