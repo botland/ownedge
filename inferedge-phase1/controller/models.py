@@ -27,6 +27,7 @@ from exceptions import (
     ProbeTimeoutError,
     TransientArtifactError,
     TransientDockerError,
+    VllmLoadError,
 )
 from gpu import get_gpu_uuids
 from schemas import ActualState, DesiredState
@@ -69,6 +70,8 @@ VLLM_IMAGE_PULL_LOG_MIN_BYTES = int(
 )
 VLLM_SHM_SIZE = int(float(os.environ.get("VLLM_SHM_SIZE_GB", "4")) * 1024**3)
 
+_vllm_cli_style_cache: tuple[str, str] | None = None
+
 _docker_client: docker.DockerClient | None = None
 _vllm_op_lock = threading.Lock()
 
@@ -78,6 +81,96 @@ def _get_client() -> docker.DockerClient:
     if _docker_client is None:
         _docker_client = docker.from_env()
     return _docker_client
+
+
+def _vllm_cli_style(client: docker.DockerClient) -> str:
+    """Return 'serve' (positional model) or 'flag' (--model) based on image entrypoint."""
+    global _vllm_cli_style_cache
+    if _vllm_cli_style_cache and _vllm_cli_style_cache[0] == VLLM_IMAGE:
+        return _vllm_cli_style_cache[1]
+    style = "flag"
+    try:
+        entrypoint = client.images.get(VLLM_IMAGE).attrs.get("Config", {}).get("Entrypoint") or []
+        if entrypoint[:2] == ["vllm", "serve"]:
+            style = "serve"
+    except DockerException:
+        logger.warning("Could not inspect %s entrypoint; defaulting vLLM CLI to --model", VLLM_IMAGE)
+    _vllm_cli_style_cache = (VLLM_IMAGE, style)
+    return style
+
+
+def _detect_quantization(model_path: str, model_id: str) -> Optional[str]:
+    config_path = os.path.join(model_path, "config.json")
+    if os.path.isfile(config_path):
+        try:
+            with open(config_path, encoding="utf-8") as config_file:
+                config = json.load(config_file)
+            quant_cfg = config.get("quantization_config") or {}
+            method = quant_cfg.get("quant_method") or quant_cfg.get("quantization_method")
+            if method:
+                return str(method).lower()
+        except (OSError, json.JSONDecodeError):
+            pass
+    model_lower = model_id.lower()
+    for method in ("awq", "gptq", "fp8", "marlin"):
+        if method in model_lower:
+            return method
+    return None
+
+
+def apply_gpu_profile(desired: DesiredState, model_id: str) -> DesiredState:
+    """Apply GPU_PROFILE=auto context and utilization tuning before config_hash."""
+    if os.environ.get("GPU_PROFILE", "auto") != "auto":
+        return desired
+    from gpu import total_vram_mb, tune_gpu_settings
+
+    capped_ctx, tuned_util = tune_gpu_settings(
+        model_id, desired.context_length, desired.gpu_utilization
+    )
+    updates: dict[str, float | int] = {}
+    if capped_ctx < desired.context_length:
+        updates["context_length"] = capped_ctx
+    if tuned_util > desired.gpu_utilization:
+        updates["gpu_utilization"] = tuned_util
+    if not updates:
+        return desired
+    logger.info(
+        "GPU_PROFILE=auto: tuned %s (%d MB VRAM): context %d -> %d, util %.2f -> %.2f",
+        model_id,
+        total_vram_mb(),
+        desired.context_length,
+        capped_ctx,
+        desired.gpu_utilization,
+        tuned_util,
+    )
+    return desired.model_copy(update=updates)
+
+
+def _build_vllm_command(
+    client: docker.DockerClient,
+    model_path: str,
+    model_id: str,
+    desired: DesiredState,
+) -> list[str]:
+    """Build container args compatible with legacy api_server and modern vllm serve images."""
+    common = [
+        "--host",
+        "0.0.0.0",
+        "--port",
+        str(VLLM_PORT),
+        "--max-model-len",
+        str(desired.context_length),
+        "--gpu-memory-utilization",
+        str(desired.gpu_utilization),
+        "--served-model-name",
+        model_id,
+    ]
+    quant = _detect_quantization(model_path, model_id)
+    if quant:
+        common.extend(["--quantization", quant])
+    if _vllm_cli_style(client) == "serve":
+        return [model_path, *common]
+    return ["--model", model_path, *common]
 
 
 def normalize_model_key(model_id: str) -> str:
@@ -112,8 +205,52 @@ def find_managed_vllm_containers() -> list:
     client = _get_client()
     return client.containers.list(
         all=True,
-        filters={"label": f"{MANAGED_LABEL}=true,{COMPONENT_LABEL}=vllm"},
+        filters={
+            "label": [f"{MANAGED_LABEL}=true", f"{COMPONENT_LABEL}=vllm"],
+        },
     )
+
+
+def _remove_container_safe(container) -> None:
+    """Stop (if running) and remove a container."""
+    name = (container.name or container.id[:12]).lstrip("/")
+    try:
+        container.reload()
+        if container.status == "running":
+            container.stop(timeout=30)
+        container.remove(force=True)
+        logger.info("Removed vLLM container %s", name)
+    except DockerException as exc:
+        raise DockerError(f"Failed to remove container {name}: {exc}") from exc
+
+
+def _docker_error_is_transient(exc: DockerException) -> bool:
+    msg = str(exc).lower()
+    return "409" in msg or "conflict" in msg or "already in use" in msg
+
+
+def _raise_docker_error(action: str, exc: DockerException) -> None:
+    if _docker_error_is_transient(exc):
+        raise TransientDockerError(f"{action}: {exc}") from exc
+    raise DockerError(f"{action}: {exc}") from exc
+
+
+def _clear_stale_vllm_slot(client: docker.DockerClient, generation: int, target_name: str) -> None:
+    """Remove wedged containers occupying a generation name before recreate."""
+    for container in find_managed_vllm_containers():
+        labels = container.labels or {}
+        if int(labels.get(GENERATION_LABEL, "0")) != generation:
+            continue
+        if container.status == "running":
+            continue
+        _remove_container_safe(container)
+
+    try:
+        existing = client.containers.get(target_name)
+    except docker.errors.NotFound:
+        return
+    if existing.status != "running":
+        _remove_container_safe(existing)
 
 
 def is_vllm_container_running() -> bool:
@@ -998,6 +1135,52 @@ def ensure_artifact(model_id: str, cache_dir: str = CACHE_DIR) -> str:
         raise ArtifactError(f"Failed to download {model_id}: {exc}") from exc
 
 
+def format_vllm_load_error(record: dict) -> str:
+    """Build an actionable operator message from a vLLM exit record."""
+    snippet = (record.get("log_snippet") or "").strip()
+    lines = [
+        line.strip()
+        for line in snippet.splitlines()
+        if line.strip() and not line.strip().startswith("\x1b")
+    ]
+    priority = (
+        "no available memory for the cache blocks",
+        "larger than the maximum number of tokens that can be stored in kv cache",
+        "error 804",
+        "out of memory",
+        "cuda out of memory",
+        "oom",
+        "valueerror",
+        "cuda",
+        "nvidia-container-cli",
+        "runtimeerror",
+        "error",
+    )
+    for token in priority:
+        for line in reversed(lines):
+            if token not in line.lower():
+                continue
+            msg = line[-400:]
+            if "cache blocks" in line.lower() or "kv cache" in line.lower():
+                msg = (
+                    f"{msg} — reduce context_length (e.g. 2048) or raise "
+                    "gpu_utilization for this GPU."
+                )
+            return f"vLLM failed to load model: {msg}"
+    exit_code = record.get("exit_code")
+    if exit_code is not None:
+        return f"vLLM container exited during load (code={exit_code})"
+    return "vLLM failed to load model"
+
+
+def has_vllm_load_failure(config_hash: str, deployment: dict) -> bool:
+    """True when this desired config already failed to load and should stay degraded."""
+    return (
+        deployment.get("config_hash") == config_hash
+        and deployment.get("exit_code") not in (None, 0)
+    )
+
+
 def _exit_record_from_container(container, exit_code: int) -> dict:
     labels = container.labels or {}
     return {
@@ -1011,15 +1194,44 @@ def _exit_record_from_container(container, exit_code: int) -> dict:
     }
 
 
+def _exit_record_changed(stored: dict, record: dict) -> bool:
+    """True when this exit record is new or materially different from SQLite."""
+    for key in ("container_id", "exit_code", "generation", "config_hash", "log_snippet"):
+        if stored.get(key) != record.get(key):
+            return True
+    return False
+
+
 async def _apply_exit_records(records: list[dict]) -> None:
+    stored = await state.get_deployment_record()
     for record in records:
+        changed = _exit_record_changed(stored, record)
         await state.update_deployment(**record)
-        logger.error(
-            "vLLM container %s exited unexpectedly (code=%s, generation=%s)",
-            record["container_id"][:12],
-            record["exit_code"],
-            record.get("generation"),
-        )
+        stored = await state.get_deployment_record()
+        if changed:
+            logger.error(
+                "vLLM container %s exited unexpectedly (code=%s, generation=%s)",
+                record["container_id"][:12],
+                record["exit_code"],
+                record.get("generation"),
+            )
+
+
+def prune_exited_vllm_containers() -> list[str]:
+    """Remove non-running managed vLLM containers (idempotent auto-heal)."""
+    actions: list[str] = []
+    for container in find_managed_vllm_containers():
+        if container.status == "running":
+            continue
+        name = (container.name or container.id[:12]).lstrip("/")
+        try:
+            _remove_container_safe(container)
+            actions.append(f"removed {name} ({container.status})")
+        except DockerException as exc:
+            actions.append(f"failed to remove {name}: {exc}")
+    if actions:
+        logger.info("Pruned exited vLLM containers: %s", "; ".join(actions))
+    return actions
 
 
 def _stop_vllm_if_needed_sync(
@@ -1041,11 +1253,10 @@ def _stop_vllm_if_needed_sync(
             exit_code = container.attrs.get("State", {}).get("ExitCode")
             if container.status != "running" and exit_code not in (None, 0):
                 exit_records.append(_exit_record_from_container(container, int(exit_code)))
-            container.stop(timeout=30)
-            container.remove(force=True)
+            _remove_container_safe(container)
             stopped += 1
         except DockerException as exc:
-            raise DockerError(f"Failed to stop container {container.id[:12]}: {exc}") from exc
+            _raise_docker_error(f"Failed to stop container {container.id[:12]}", exc)
     return stopped, exit_records
 
 
@@ -1352,9 +1563,7 @@ def heal_deployment_environment(force_restart_running: bool = False) -> list[str
             continue
         name = (container.name or container.id[:12]).lstrip("/")
         try:
-            if status == "running":
-                container.stop(timeout=15)
-            container.remove(force=True)
+            _remove_container_safe(container)
             actions.append(f"removed {name} ({status})")
         except DockerException as exc:
             actions.append(f"failed to remove {name}: {exc}")
@@ -1367,9 +1576,7 @@ def heal_deployment_environment(force_restart_running: bool = False) -> list[str
         if labels.get(MANAGED_LABEL) == "true":
             continue
         try:
-            if container.status == "running":
-                container.stop(timeout=15)
-            container.remove(force=True)
+            _remove_container_safe(container)
             actions.append(f"removed orphan {name}")
         except DockerException as exc:
             actions.append(f"failed to remove orphan {name}: {exc}")
@@ -1404,10 +1611,12 @@ def _start_or_update_vllm_sync_locked(
     generation: int,
 ) -> tuple[str, Optional[dict]]:
     model_key = normalize_model_key(model_id)
+    target_name = f"inferedge-vllm-gen{generation}"
     logger.info("Starting vLLM for %s (generation=%d)", model_id, generation)
     gpu_ids = get_gpu_uuids()
     labels = _build_labels(model_key, config_hash, generation, gpu_ids)
 
+    client = _get_client()
     for container in find_managed_vllm_containers():
         cl = container.labels or {}
         if (
@@ -1418,23 +1627,11 @@ def _start_or_update_vllm_sync_locked(
             logger.info("Reusing running vLLM container %s", container.id[:12])
             return container.id, None
 
-    client = _get_client()
+    _clear_stale_vllm_slot(client, generation, target_name)
     _ensure_vllm_image(client)
     _ensure_model_metadata(model_id, model_path)
     env = {"HF_TOKEN": HF_TOKEN} if HF_TOKEN else {}
-    command = [
-        model_path,
-        "--host",
-        "0.0.0.0",
-        "--port",
-        str(VLLM_PORT),
-        "--max-model-len",
-        str(desired.context_length),
-        "--gpu-memory-utilization",
-        str(desired.gpu_utilization),
-        "--served-model-name",
-        model_id,
-    ]
+    command = _build_vllm_command(client, model_path, model_id, desired)
 
     device_requests = [
         DeviceRequest(count=-1, capabilities=[["gpu"]]),
@@ -1442,12 +1639,13 @@ def _start_or_update_vllm_sync_locked(
 
     logger.info(
         "Creating vLLM container %s on network %s (shm=%s, cache=%s:%s)",
-        f"inferedge-vllm-gen{generation}",
+        target_name,
         DOCKER_NETWORK,
         _format_bytes(VLLM_SHM_SIZE),
         MODEL_CACHE_HOST,
         CACHE_DIR,
     )
+    container = None
     try:
         container = client.containers.run(
             VLLM_IMAGE,
@@ -1458,7 +1656,7 @@ def _start_or_update_vllm_sync_locked(
             volumes={MODEL_CACHE_HOST: {"bind": CACHE_DIR, "mode": "rw"}},
             device_requests=device_requests,
             network=DOCKER_NETWORK,
-            name=f"inferedge-vllm-gen{generation}",
+            name=target_name,
             remove=False,
             shm_size=VLLM_SHM_SIZE,
         )
@@ -1469,7 +1667,8 @@ def _start_or_update_vllm_sync_locked(
             pass
         network.connect(container.id, aliases=[VLLM_ALIAS])
     except DockerException as exc:
-        raise DockerError(f"Failed to start vLLM container: {exc}") from exc
+        _clear_stale_vllm_slot(client, generation, target_name)
+        _raise_docker_error("Failed to start vLLM container", exc)
 
     deadline = time.time() + CONTAINER_STARTUP_TIMEOUT
     while time.time() < deadline:
@@ -1498,9 +1697,7 @@ async def start_or_update_vllm(
     )
     if exit_record:
         await _apply_exit_records([exit_record])
-        raise DockerError(
-            f"vLLM container exited during startup (code={exit_record['exit_code']})"
-        )
+        raise VllmLoadError(format_vllm_load_error(exit_record))
 
     gpu_ids = get_gpu_uuids()
     model_key = normalize_model_key(model_id)
@@ -1564,9 +1761,7 @@ def _raise_if_vllm_container_exited() -> None:
         if container.status in ("exited", "dead"):
             exit_code = int(container.attrs.get("State", {}).get("ExitCode", 1))
             record = _exit_record_from_container(container, exit_code)
-            snippet = (record.get("log_snippet") or "").strip().splitlines()
-            detail = snippet[-1] if snippet else f"exit code {exit_code}"
-            raise DockerError(f"vLLM container exited during startup ({detail})")
+            raise VllmLoadError(format_vllm_load_error(record))
 
 
 def _wait_for_probes_sync(model_id: str) -> ActualState:
@@ -1595,11 +1790,18 @@ def _get_deployment_status_sync(
     running = [c for c in containers if c.status == "running"]
     exit_records: list[dict] = []
 
+    latest_failed: tuple[int, dict] | None = None
     for container in containers:
         if container.status not in ("running",):
             exit_code = container.attrs.get("State", {}).get("ExitCode")
-            if exit_code not in (None, 0):
-                exit_records.append(_exit_record_from_container(container, int(exit_code)))
+            if exit_code in (None, 0):
+                continue
+            labels = container.labels or {}
+            generation = int(labels.get(GENERATION_LABEL, "0"))
+            failed = _exit_record_from_container(container, int(exit_code))
+            if latest_failed is None or generation >= latest_failed[0]:
+                latest_failed = (generation, failed)
+    exit_records = [latest_failed[1]] if latest_failed else []
 
     if not running:
         return ActualState(

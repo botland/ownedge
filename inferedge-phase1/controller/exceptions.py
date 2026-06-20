@@ -20,3 +20,7 @@ class TransientDockerError(DockerError):
 
 class ProbeTimeoutError(InferEdgeError):
     """vLLM health/model probe timed out."""
+
+
+class VllmLoadError(InferEdgeError):
+    """vLLM failed to load the model (container crash, CUDA/driver mismatch, etc.)."""

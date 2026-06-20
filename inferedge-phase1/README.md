@@ -17,8 +17,8 @@ cp .env.example .env
 # Edit .env: set CONTROLLER_API_TOKEN and HF_TOKEN (required for Llama)
 # Accept the model license at https://huggingface.co/meta-llama/Llama-3.1-8B-Instruct
 
-docker compose up -d --build
-docker compose logs -f controller
+./scripts/compose.sh up -d --build
+./scripts/compose.sh logs -f controller
 ```
 
 ## Check Status
@@ -38,7 +38,8 @@ The reconciler retries automatically every `RECONCILE_INTERVAL_SEC` (default 5s)
 | Download stall / timeout / network blip | `RECONCILING` | Clears HF locks + XET staging, resumes partial cache, retries |
 | HF auth / license (401/403) | `DEGRADED` | Stops — fix `HF_TOKEN` or accept model license |
 | Disk full | `DEGRADED` | Stops — free space under `MODEL_CACHE_HOST` |
-| vLLM crash / Docker error | `FAILED` → retry | Next cycle recreates container |
+| vLLM crash during model load (CUDA/driver, container exit) | `DEGRADED` | Stops retrying for same config — fix driver/image, then change model/config or restart controller |
+| vLLM Docker daemon error (create/stop) | `FAILED` → retry | Next cycle retries container operations |
 | No GPU | `DEGRADED` | Expected CPU-only mode |
 
 Watch auto-retry in logs: `Transient download issue (will retry)` or `/status` with `last_error: "Auto-retry: ..."`.
@@ -51,7 +52,7 @@ Desired state is stored in SQLite and survives reboots. To switch models:
 
 ```bash
 # Edit DEFAULT_MODEL in .env, then recreate the controller to pick up env vars:
-docker compose up -d --force-recreate controller
+./scripts/compose.sh up -d --force-recreate controller
 ```
 
 On startup the controller compares `.env` to SQLite and queues a `load_model` intent if they differ.
@@ -72,9 +73,9 @@ Aliases (`llama-3.1-8b`, `default`) resolve via the `model_aliases` SQLite table
 **Option C — reset persisted state**
 
 ```bash
-docker compose down
+./scripts/compose.sh down
 docker volume rm inferedge_controller_data
-docker compose up -d
+./scripts/compose.sh up -d
 ```
 
 ## Inference via LiteLLM
@@ -127,6 +128,7 @@ On unexpected exit, the last ~200 log lines and exit code are stored in `deploym
 | Variable | Default | Description |
 |---|---|---|
 | `CONTROLLER_API_TOKEN` | (empty) | Bearer token for `/models/load`; empty disables auth |
+| `CONTROLLER_SHM_PCT` | 40 | **Source of truth** for controller `/dev/shm` size (% of host RAM; Ray needs >30%). `./scripts/compose.sh` writes derived `CONTROLLER_SHM_SIZE_GB` into `.env` before compose runs. |
 | `VLLM_CONTAINER_STARTUP_TIMEOUT_SEC` | 120 | Container running-state timeout |
 | `VLLM_PROBE_TIMEOUT_SEC` | 600 | `/health` + `/v1/models` probe timeout |
 | `RECONCILE_INTERVAL_SEC` | 5 | Reconciler loop interval |
@@ -165,4 +167,8 @@ Schema version is tracked in `schema_meta`. To add a migration:
 | `FAILED` + Docker error | Daemon / GPU passthrough | Check `docker compose logs controller` and `deployments.log_snippet` in `/status` |
 | `RECONCILING` (long) | First model download | Check `curl localhost:8080/status` for `download_bytes`; files appear under `MODEL_CACHE_HOST` on host |
 | Empty `MODEL_CACHE_HOST` during download | Cache path bug (old builds) | Rebuild controller; ensure compose sets `LOCAL_MODEL_CACHE=/models_cache` inside container |
+| Ray `/dev/shm` performance warning | `shm_size` too small | Raise `CONTROLLER_SHM_PCT` (≥35) in `.env`, then `./scripts/compose.sh up -d --force-recreate controller` |
+| Download interrupted, exit code 137 | Container killed (SIGKILL) | Usually `docker compose --force-recreate` or OOM kill — download resumes from partial cache; avoid recreating controller mid-download |
+| `FAILED` + vLLM name conflict (409) | Stale `inferedge-vllm-gen*` in `created` state | Controller auto-heals on retry; or `docker rm -f inferedge-vllm-gen1` then wait for reconcile |
+| `DEGRADED` + CUDA 804 / driver mismatch | vLLM image CUDA newer than host driver | Upgrade NVIDIA driver (≥550 for CUDA 12.4 images) or pin older `VLLM_IMAGE`; retry via `POST /models/load` |
 | `POST /v1/chat/completions` 404 on :8080 | Wrong port | Use `http://localhost/v1/...` (port 80), not the controller API |

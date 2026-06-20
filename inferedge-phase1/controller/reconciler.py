@@ -24,6 +24,7 @@ from exceptions import (
     ProbeTimeoutError,
     TransientArtifactError,
     TransientDockerError,
+    VllmLoadError,
 )
 from schemas import ActualState, ApplianceState, ReconcileMetrics
 
@@ -258,6 +259,7 @@ class Reconciler:
             desired = await state.get_desired_state()
             resolved_model = await state.resolve_model(desired.model)
             desired = desired.model_copy(update={"model": resolved_model})
+            desired = await asyncio.to_thread(models.apply_gpu_profile, desired, resolved_model)
 
             config_hash = models.compute_config_hash(desired)
             actual = await models.get_deployment_status(resolved_model)
@@ -279,6 +281,24 @@ class Reconciler:
                 )
                 return
 
+            if intents_processed == 0 and models.has_vllm_load_failure(config_hash, deployment):
+                await asyncio.to_thread(models.prune_exited_vllm_containers)
+                last_error = await asyncio.to_thread(
+                    gpu.check_vram_for_model,
+                    resolved_model,
+                    desired.context_length,
+                    desired.gpu_utilization,
+                ) or models.format_vllm_load_error(deployment)
+                await state.update_desired_state(desired)
+                await state.set_appliance_state(
+                    ApplianceState.DEGRADED,
+                    last_error,
+                    time.time(),
+                    actual=actual,
+                )
+                logger.warning("vLLM load failure persists for config %s; staying DEGRADED", config_hash[:12])
+                return
+
             action_taken = True
             await state.set_appliance_state(
                 ApplianceState.RECONCILING, last_error=None, last_reconcile_ts=time.time()
@@ -293,6 +313,30 @@ class Reconciler:
                 await state.log_reconcile_event(
                     "gpu_unavailable",
                     {"duration_ms": (time.monotonic() - start) * 1000, "intents_processed": intents_processed},
+                )
+                return
+
+            vram_err = await asyncio.to_thread(
+                gpu.check_vram_for_model,
+                resolved_model,
+                desired.context_length,
+                desired.gpu_utilization,
+            )
+            if vram_err:
+                await asyncio.to_thread(models.prune_exited_vllm_containers)
+                await state.update_desired_state(desired)
+                await state.update_deployment(exit_code=1, log_snippet=vram_err)
+                actual = await models.get_deployment_status(resolved_model)
+                await state.set_appliance_state(
+                    ApplianceState.DEGRADED, vram_err, time.time(), actual=actual
+                )
+                await state.log_reconcile_event(
+                    "vram_insufficient",
+                    {
+                        "duration_ms": (time.monotonic() - start) * 1000,
+                        "intents_processed": intents_processed,
+                        "error": vram_err,
+                    },
                 )
                 return
 
@@ -395,6 +439,23 @@ class Reconciler:
                 )
                 logger.warning("Transient Docker issue (will retry): %s", exc)
                 return
+            except VllmLoadError as exc:
+                last_error = str(exc)
+                await state.update_desired_state(desired)
+                actual = await models.get_deployment_status(resolved_model)
+                await state.set_appliance_state(
+                    ApplianceState.DEGRADED, last_error, time.time(), actual=actual
+                )
+                await state.log_reconcile_event(
+                    "vllm_load_error",
+                    {
+                        "duration_ms": (time.monotonic() - start) * 1000,
+                        "intents_processed": intents_processed,
+                        "vllm_restarts": vllm_restarts,
+                        "error": last_error,
+                    },
+                )
+                return
             except DockerError as exc:
                 last_error = str(exc)
                 new_state = ApplianceState.FAILED
@@ -439,45 +500,66 @@ class Reconciler:
                 )
                 new_state = ApplianceState.READY
             except asyncio.TimeoutError:
+                actual = await models.get_deployment_status(resolved_model)
                 if await asyncio.to_thread(models.is_vllm_container_running):
                     last_error = (
                         f"Still loading {resolved_model} (API not ready after "
                         f"{probe_timeout}s; container running)"
                     )
-                    actual = await models.get_deployment_status(resolved_model)
+                    new_state = ApplianceState.RECONCILING
                     logger.info("%s", last_error)
+                elif actual.exit_code not in (None, 0):
+                    last_error = models.format_vllm_load_error(
+                        {**deployment, "exit_code": actual.exit_code, "log_snippet": actual.log_snippet}
+                    )
+                    new_state = ApplianceState.DEGRADED
+                    logger.warning("%s", last_error)
                 else:
                     await asyncio.to_thread(models.heal_deployment_environment, True)
                     last_error = (
                         f"vLLM probes timed out after {probe_timeout}s; auto-retrying"
                     )
-                    actual = await models.get_deployment_status(resolved_model)
+                    new_state = ApplianceState.RECONCILING
                     logger.warning("%s", last_error)
-                await state.set_appliance_state(
-                    ApplianceState.RECONCILING,
-                    last_error,
-                    time.time(),
-                    actual=actual,
-                )
+                await state.set_appliance_state(new_state, last_error, time.time(), actual=actual)
                 return
             except ProbeTimeoutError as exc:
+                actual = await models.get_deployment_status(resolved_model)
                 if await asyncio.to_thread(models.is_vllm_container_running):
                     last_error = (
                         f"Still loading {resolved_model} (API not ready after "
                         f"{probe_timeout}s; container running)"
                     )
-                    actual = await models.get_deployment_status(resolved_model)
+                    new_state = ApplianceState.RECONCILING
                     logger.info("%s", last_error)
+                elif actual.exit_code not in (None, 0):
+                    last_error = models.format_vllm_load_error(
+                        {**deployment, "exit_code": actual.exit_code, "log_snippet": actual.log_snippet}
+                    )
+                    new_state = ApplianceState.DEGRADED
+                    logger.warning("%s", last_error)
                 else:
                     await asyncio.to_thread(models.heal_deployment_environment, True)
                     last_error = f"Auto-retry: {exc}"
-                    actual = await models.get_deployment_status(resolved_model)
+                    new_state = ApplianceState.RECONCILING
                     logger.warning("Probe timeout (will retry): %s", exc)
+                await state.set_appliance_state(new_state, last_error, time.time(), actual=actual)
+                return
+            except VllmLoadError as exc:
+                last_error = str(exc)
+                await state.update_desired_state(desired)
+                actual = await models.get_deployment_status(resolved_model)
                 await state.set_appliance_state(
-                    ApplianceState.RECONCILING,
-                    last_error,
-                    time.time(),
-                    actual=actual,
+                    ApplianceState.DEGRADED, last_error, time.time(), actual=actual
+                )
+                await state.log_reconcile_event(
+                    "vllm_load_error",
+                    {
+                        "duration_ms": (time.monotonic() - start) * 1000,
+                        "intents_processed": intents_processed,
+                        "vllm_restarts": vllm_restarts,
+                        "error": last_error,
+                    },
                 )
                 return
             except DockerError as exc:

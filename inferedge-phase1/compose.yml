@@ -45,7 +45,8 @@ services:
 
   controller:
     build: ./controller
-    shm_size: "4gb"
+    # CONTROLLER_SHM_SIZE_GB is derived from CONTROLLER_SHM_PCT in .env by scripts/resolve-shm.sh
+    shm_size: "${CONTROLLER_SHM_SIZE_GB}gb"
     ports:
       - "${CONTROLLER_PORT}:${CONTROLLER_PORT}"
     environment:
