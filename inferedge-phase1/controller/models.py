@@ -50,6 +50,8 @@ DOCKER_NETWORK = f"{COMPOSE_PROJECT}_default"
 VLLM_IMAGE = os.environ.get("VLLM_IMAGE", "vllm/vllm-openai:latest")
 VLLM_PORT = int(os.environ.get("VLLM_INTERNAL_PORT", "8000"))
 CACHE_DIR = os.environ.get("LOCAL_MODEL_CACHE", "/models_cache")
+# Host path for model cache — required when spawning vLLM via the Docker socket.
+MODEL_CACHE_HOST = os.environ.get("MODEL_CACHE_HOST", CACHE_DIR)
 HF_TOKEN = os.environ.get("HF_TOKEN", "")
 HF_DOWNLOAD_TIMEOUT = int(os.environ.get("HF_DOWNLOAD_TIMEOUT_SEC", "7200"))
 HF_DOWNLOAD_STALL_SEC = int(os.environ.get("HF_DOWNLOAD_STALL_SEC", "3600"))
@@ -62,6 +64,9 @@ CONTAINER_STARTUP_TIMEOUT = int(os.environ.get("VLLM_CONTAINER_STARTUP_TIMEOUT_S
 PROBE_TIMEOUT = int(os.environ.get("VLLM_PROBE_TIMEOUT_SEC", "600"))
 VLLM_IMAGE_PULL_TIMEOUT = int(os.environ.get("VLLM_IMAGE_PULL_TIMEOUT_SEC", "3600"))
 VLLM_IMAGE_PULL_STALL_SEC = int(os.environ.get("VLLM_IMAGE_PULL_STALL_SEC", "300"))
+VLLM_IMAGE_PULL_LOG_MIN_BYTES = int(
+    float(os.environ.get("VLLM_IMAGE_PULL_LOG_MIN_BYTES_MB", "50")) * 1024 * 1024
+)
 VLLM_SHM_SIZE = int(float(os.environ.get("VLLM_SHM_SIZE_GB", "4")) * 1024**3)
 
 _docker_client: docker.DockerClient | None = None
@@ -109,6 +114,39 @@ def find_managed_vllm_containers() -> list:
         all=True,
         filters={"label": f"{MANAGED_LABEL}=true,{COMPONENT_LABEL}=vllm"},
     )
+
+
+def is_vllm_container_running() -> bool:
+    return any(c.status == "running" for c in find_managed_vllm_containers())
+
+
+def get_vllm_load_hint(container_id: str | None = None) -> str | None:
+    """Best-effort tail line from the running vLLM container for /status."""
+    container = None
+    if container_id:
+        try:
+            candidate = _get_client().containers.get(container_id)
+            if candidate.status == "running":
+                container = candidate
+        except DockerException:
+            pass
+    if container is None:
+        running = [c for c in find_managed_vllm_containers() if c.status == "running"]
+        if not running:
+            return None
+        container = running[0]
+    try:
+        raw = container.logs(tail=40).decode("utf-8", errors="replace")
+    except DockerException:
+        return None
+    for line in reversed(raw.splitlines()):
+        stripped = line.strip()
+        if len(stripped) < 8:
+            continue
+        if stripped.startswith("\x1b"):
+            continue
+        return stripped[-200:]
+    return None
 
 
 def _capture_container_logs(container, exit_code: int) -> str:
@@ -198,6 +236,95 @@ def _walk_model_files(target: str):
     for root, dirs, files in os.walk(target):
         dirs[:] = [d for d in dirs if d not in _HF_INTERNAL_DIRS]
         yield root, files
+
+
+def _cache_has_config(target: str) -> bool:
+    return os.path.isfile(os.path.join(target, "config.json"))
+
+
+_REQUIRED_JSON_FILES = (
+    "config.json",
+    "tokenizer_config.json",
+    "tokenizer.json",
+    "special_tokens_map.json",
+)
+_JSON_SIZE_LIMITS: dict[str, int] = {
+    "config.json": 1 * 1024 * 1024,
+    "tokenizer_config.json": 1 * 1024 * 1024,
+    "special_tokens_map.json": 1 * 1024 * 1024,
+    "generation_config.json": 1 * 1024 * 1024,
+    "model.safetensors.index.json": 50 * 1024 * 1024,
+    "tokenizer.json": 200 * 1024 * 1024,
+}
+
+
+def _json_file_valid(path: str) -> bool:
+    try:
+        with open(path, encoding="utf-8") as json_f:
+            json.load(json_f)
+        return True
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError, ValueError):
+        return False
+
+
+def _metadata_needs_redownload(path: str, filename: str) -> bool:
+    if not os.path.isfile(path):
+        return True
+    try:
+        size = os.path.getsize(path)
+    except OSError:
+        return True
+    limit = _JSON_SIZE_LIMITS.get(filename)
+    if limit is not None and size > limit:
+        return True
+    return not _json_file_valid(path)
+
+
+def _validate_model_cache(model_id: str, target: str) -> list[str]:
+    """Return metadata filenames that are missing or corrupt."""
+    missing: list[str] = []
+    for name in _REQUIRED_JSON_FILES:
+        path = os.path.join(target, name)
+        if not _metadata_needs_redownload(path, name):
+            continue
+        if os.path.isfile(path):
+            try:
+                os.remove(path)
+            except OSError:
+                pass
+            logger.warning("Removed corrupt metadata %s for %s", name, model_id)
+        missing.append(name)
+
+    index_name = "model.safetensors.index.json"
+    index_path = os.path.join(target, index_name)
+    if os.path.isfile(index_path) and _metadata_needs_redownload(index_path, index_name):
+        try:
+            os.remove(index_path)
+        except OSError:
+            pass
+        logger.warning("Removed corrupt metadata %s for %s", index_name, model_id)
+        missing.append(index_name)
+    return missing
+
+
+def _repair_model_metadata(model_id: str, target: str, filenames: list[str]) -> None:
+    os.makedirs(target, exist_ok=True)
+    for filename in filenames:
+        logger.info("Re-downloading metadata %s for %s", filename, model_id)
+        _download_file(model_id, filename, target)
+
+
+def _ensure_model_metadata(model_id: str, target: str) -> None:
+    missing = _validate_model_cache(model_id, target)
+    if not missing:
+        return
+    _repair_model_metadata(model_id, target, missing)
+    still_missing = _validate_model_cache(model_id, target)
+    if still_missing:
+        raise ArtifactError(
+            f"Model metadata still invalid for {model_id}: {', '.join(still_missing)}. "
+            f"Delete {target} and retry."
+        )
 
 
 def _cache_has_weights(target: str) -> bool:
@@ -415,6 +542,9 @@ def _file_looks_corrupt(filename: str, size: int) -> bool:
         return True
     if filename.endswith(WEIGHT_SUFFIXES):
         return False
+    limit = _JSON_SIZE_LIMITS.get(filename)
+    if limit is not None:
+        return size > limit
     if _is_metadata_file(filename):
         return size > 50 * 1024 * 1024
     return False
@@ -793,6 +923,7 @@ def ensure_artifact(model_id: str, cache_dir: str = CACHE_DIR) -> str:
     model_key = normalize_model_key(model_id)
     target = os.path.join(cache_dir, model_key)
     if _cache_has_weights(target):
+        _ensure_model_metadata(model_id, target)
         logger.info("Model cache ready for %s at %s", model_id, target)
         return target
 
@@ -837,6 +968,7 @@ def ensure_artifact(model_id: str, cache_dir: str = CACHE_DIR) -> str:
                 f"Download finished but no model weights found for {model_id}. "
                 f"Check HF_TOKEN and license access at https://huggingface.co/{model_id}"
             )
+        _ensure_model_metadata(model_id, target)
         return target
     except ArtifactError as exc:
         if isinstance(exc, TransientArtifactError):
@@ -936,40 +1068,224 @@ def _vllm_image_present(client: docker.DockerClient) -> bool:
         return False
 
 
+_VLLM_PULL_PROGRESS_FILE = os.path.join(CACHE_DIR, ".inferedge-vllm-pull-progress")
+_VLLM_PULL_TRACKED_STATUSES = frozenset({
+    "Pulling fs layer",
+    "Downloading",
+    "Extracting",
+    "Download complete",
+    "Pull complete",
+    "Waiting",
+    "Pulling from",
+})
+
+
+def _vllm_pull_progress_path() -> str:
+    return _VLLM_PULL_PROGRESS_FILE
+
+
+def get_vllm_pull_progress() -> dict:
+    """Return in-progress vLLM image pull stats for /status polling."""
+    path = _vllm_pull_progress_path()
+    if not os.path.isfile(path):
+        return {}
+    try:
+        with open(path, encoding="utf-8") as progress_f:
+            raw = progress_f.read().strip()
+    except OSError:
+        return {}
+    if not raw:
+        return {}
+    percent_str, _, bytes_summary = raw.partition("|")
+    try:
+        percent = float(percent_str)
+    except ValueError:
+        return {}
+    return {
+        "percent": percent,
+        "human": bytes_summary or f"{percent:.1f}%",
+    }
+
+
+def _clear_vllm_pull_progress() -> None:
+    try:
+        os.remove(_vllm_pull_progress_path())
+    except OSError:
+        pass
+
+
+def _write_vllm_pull_progress(percent: float | None, bytes_summary: str | None = None) -> None:
+    if percent is None:
+        return
+    try:
+        os.makedirs(CACHE_DIR, exist_ok=True)
+        content = f"{percent:.1f}"
+        if bytes_summary:
+            content += f"|{bytes_summary}"
+        with open(_vllm_pull_progress_path(), "w", encoding="utf-8") as progress_f:
+            progress_f.write(content)
+    except OSError:
+        pass
+
+
+def _docker_pull_progress_bytes(line: dict) -> tuple[int | None, int | None]:
+    detail = line.get("progressDetail") or {}
+    current = detail.get("current")
+    total = detail.get("total")
+    if not isinstance(total, int) or total <= 0:
+        if isinstance(current, int):
+            return current, None
+        return None, None
+    current_val = int(current) if isinstance(current, int) else 0
+    return current_val, int(total)
+
+
+def _update_docker_pull_layers(
+    layer_id: str,
+    status: str,
+    line: dict,
+    layer_totals: dict[str, int],
+    layer_current: dict[str, int],
+) -> None:
+    if not layer_id:
+        return
+    current, total = _docker_pull_progress_bytes(line)
+    if total is not None:
+        layer_totals[layer_id] = total
+    if current is not None:
+        layer_current[layer_id] = current
+    if status in {"Download complete", "Pull complete"} and layer_id in layer_totals:
+        layer_current[layer_id] = layer_totals[layer_id]
+
+
+def _docker_pull_done_bytes(
+    layer_totals: dict[str, int],
+    layer_current: dict[str, int],
+) -> int:
+    return sum(
+        min(layer_current.get(layer_id, 0), layer_total)
+        for layer_id, layer_total in layer_totals.items()
+    )
+
+
+def _docker_pull_overall_percent(
+    layer_totals: dict[str, int],
+    layer_current: dict[str, int],
+) -> float | None:
+    if not layer_totals:
+        return None
+    total_bytes = sum(layer_totals.values())
+    if total_bytes <= 0:
+        return None
+    done_bytes = _docker_pull_done_bytes(layer_totals, layer_current)
+    return min(100.0, done_bytes * 100.0 / total_bytes)
+
+
+def _docker_pull_bytes_summary(
+    layer_totals: dict[str, int],
+    layer_current: dict[str, int],
+) -> str | None:
+    if not layer_totals:
+        return None
+    total_bytes = sum(layer_totals.values())
+    if total_bytes <= 0:
+        return None
+    done_bytes = _docker_pull_done_bytes(layer_totals, layer_current)
+    return f"{_format_bytes(done_bytes)}/{_format_bytes(total_bytes)}"
+
+
+def _format_vllm_pull_log(
+    status: str,
+    layer_id: str,
+    progress: str,
+    overall_pct: float | None,
+    bytes_summary: str | None,
+) -> str:
+    layer_ref = layer_id[:12] if layer_id else ""
+    detail = " ".join(part for part in (layer_ref, status, progress) if part)
+    if overall_pct is not None:
+        headline = f"{overall_pct:.1f}%"
+        if bytes_summary:
+            headline = f"{headline} ({bytes_summary})"
+        return f"vLLM pull: {headline} — {detail}" if detail else f"vLLM pull: {headline}"
+    return f"vLLM pull: {detail}" if detail else f"vLLM pull: {status}"
+
+
+def _should_log_vllm_pull_progress(
+    done_bytes: int,
+    last_logged_done_bytes: int,
+    overall_pct: float | None,
+    last_logged_pct: float | None,
+) -> bool:
+    if last_logged_done_bytes < 0:
+        return True
+    if done_bytes - last_logged_done_bytes >= VLLM_IMAGE_PULL_LOG_MIN_BYTES:
+        return True
+    if overall_pct is not None and last_logged_pct is not None:
+        return round(overall_pct, 1) != round(last_logged_pct, 1)
+    return done_bytes != last_logged_done_bytes
+
+
 def _pull_vllm_image_worker(image: str, pull_stall_sec: int) -> None:
     """Pull vLLM image in an isolated subprocess (killable on timeout/stall)."""
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
     client = docker.from_env()
     logger.info("Pulling vLLM image %s", image)
-    last_activity = time.monotonic()
+    _clear_vllm_pull_progress()
+    last_stream_activity = time.monotonic()
+    last_byte_activity = time.monotonic()
+    last_done_bytes = 0
+    last_logged_done_bytes = -1
+    last_logged_pct: float | None = None
+    layer_totals: dict[str, int] = {}
+    layer_current: dict[str, int] = {}
     try:
         for line in client.api.pull(image, stream=True, decode=True):
             now = time.monotonic()
-            if now - last_activity > pull_stall_sec:
-                raise RuntimeError(f"Stalled pulling {image} for {pull_stall_sec}s")
+            if now - last_stream_activity > pull_stall_sec:
+                raise RuntimeError(f"Stalled pulling {image} for {pull_stall_sec}s (no Docker events)")
             status = line.get("status") or ""
             layer_id = line.get("id") or ""
             progress = line.get("progress") or ""
             error = line.get("error")
             if error:
                 raise RuntimeError(f"Failed to pull {image}: {error}")
-            if status in {
-                "Pulling fs layer",
-                "Downloading",
-                "Extracting",
-                "Download complete",
-                "Pull complete",
-                "Waiting",
-                "Pulling from",
-            }:
-                last_activity = now
-                if progress or layer_id:
-                    logger.info("vLLM pull %s: %s %s", layer_id, status, progress)
-                else:
-                    logger.info("vLLM pull: %s", status)
+            if status == "Pulling fs layer":
+                last_stream_activity = now
+                continue
+            if status in _VLLM_PULL_TRACKED_STATUSES:
+                last_stream_activity = now
+                _update_docker_pull_layers(layer_id, status, line, layer_totals, layer_current)
+                done_bytes = _docker_pull_done_bytes(layer_totals, layer_current)
+                if done_bytes > last_done_bytes:
+                    last_done_bytes = done_bytes
+                    last_byte_activity = now
+                elif (
+                    status == "Downloading"
+                    and done_bytes > 0
+                    and now - last_byte_activity > pull_stall_sec
+                ):
+                    summary = _docker_pull_bytes_summary(layer_totals, layer_current)
+                    raise RuntimeError(
+                        f"Stalled pulling {image} for {pull_stall_sec}s at {summary or 'unknown progress'}"
+                    )
+                overall_pct = _docker_pull_overall_percent(layer_totals, layer_current)
+                bytes_summary = _docker_pull_bytes_summary(layer_totals, layer_current)
+                _write_vllm_pull_progress(overall_pct, bytes_summary)
+                if status in {"Downloading", "Extracting"}:
+                    if not _should_log_vllm_pull_progress(
+                        done_bytes, last_logged_done_bytes, overall_pct, last_logged_pct
+                    ):
+                        continue
+                    last_logged_done_bytes = done_bytes
+                    last_logged_pct = overall_pct
+                logger.info(
+                    _format_vllm_pull_log(status, layer_id, progress, overall_pct, bytes_summary)
+                )
     except DockerException as exc:
         raise RuntimeError(f"Failed to pull {image}: {exc}") from exc
     client.images.get(image)
+    _clear_vllm_pull_progress()
     logger.info("vLLM image pull finished: %s", image)
 
 
@@ -982,6 +1298,7 @@ def _run_vllm_image_pull_watchdog() -> None:
         logger.info("vLLM image present: %s", VLLM_IMAGE)
         return
 
+    _clear_vllm_pull_progress()
     logger.info(
         "Pulling vLLM image %s (timeout=%ss, stall=%ss)",
         VLLM_IMAGE,
@@ -1103,10 +1420,9 @@ def _start_or_update_vllm_sync_locked(
 
     client = _get_client()
     _ensure_vllm_image(client)
+    _ensure_model_metadata(model_id, model_path)
     env = {"HF_TOKEN": HF_TOKEN} if HF_TOKEN else {}
     command = [
-        "vllm",
-        "serve",
         model_path,
         "--host",
         "0.0.0.0",
@@ -1116,6 +1432,8 @@ def _start_or_update_vllm_sync_locked(
         str(desired.context_length),
         "--gpu-memory-utilization",
         str(desired.gpu_utilization),
+        "--served-model-name",
+        model_id,
     ]
 
     device_requests = [
@@ -1123,10 +1441,12 @@ def _start_or_update_vllm_sync_locked(
     ]
 
     logger.info(
-        "Creating vLLM container %s on network %s (shm=%s)",
+        "Creating vLLM container %s on network %s (shm=%s, cache=%s:%s)",
         f"inferedge-vllm-gen{generation}",
         DOCKER_NETWORK,
         _format_bytes(VLLM_SHM_SIZE),
+        MODEL_CACHE_HOST,
+        CACHE_DIR,
     )
     try:
         container = client.containers.run(
@@ -1135,7 +1455,7 @@ def _start_or_update_vllm_sync_locked(
             detach=True,
             labels=labels,
             environment=env,
-            volumes={CACHE_DIR: {"bind": CACHE_DIR, "mode": "rw"}},
+            volumes={MODEL_CACHE_HOST: {"bind": CACHE_DIR, "mode": "rw"}},
             device_requests=device_requests,
             network=DOCKER_NETWORK,
             name=f"inferedge-vllm-gen{generation}",
@@ -1196,6 +1516,23 @@ async def start_or_update_vllm(
     return container_id
 
 
+def _model_probe_match(model_id: str, served_ids: list[str]) -> bool:
+    key = normalize_model_key(model_id)
+    tail = model_id.split("/")[-1]
+    for mid in served_ids:
+        if not mid:
+            continue
+        normalized = mid.rstrip("/")
+        if (
+            model_id in mid
+            or key in mid
+            or normalized.endswith(tail)
+            or normalized.endswith(key)
+        ):
+            return True
+    return False
+
+
 def _probe_vllm(model_id: str) -> ActualState:
     base = f"http://{VLLM_ALIAS}:{VLLM_PORT}"
     actual = ActualState(health="STARTING")
@@ -1211,19 +1548,32 @@ def _probe_vllm(model_id: str) -> ActualState:
                 return actual
             data = models_resp.json()
             model_ids = [m.get("id", "") for m in data.get("data", [])]
-            model_loaded = any(model_id in mid or mid.endswith(model_id.split("/")[-1]) for mid in model_ids)
+            model_loaded = _model_probe_match(model_id, model_ids)
             actual.model_loaded = model_loaded
             actual.current_model = model_id if model_loaded else None
             actual.health = "HEALTHY" if model_loaded else "LOADING"
     except httpx.RequestError:
-        actual.health = "UNREACHABLE"
+        # vLLM does not bind :8000 until weights are loaded; a running container
+        # with no listener is still loading, not a network failure.
+        actual.health = "LOADING" if is_vllm_container_running() else "UNREACHABLE"
     return actual
+
+
+def _raise_if_vllm_container_exited() -> None:
+    for container in find_managed_vllm_containers():
+        if container.status in ("exited", "dead"):
+            exit_code = int(container.attrs.get("State", {}).get("ExitCode", 1))
+            record = _exit_record_from_container(container, exit_code)
+            snippet = (record.get("log_snippet") or "").strip().splitlines()
+            detail = snippet[-1] if snippet else f"exit code {exit_code}"
+            raise DockerError(f"vLLM container exited during startup ({detail})")
 
 
 def _wait_for_probes_sync(model_id: str) -> ActualState:
     deadline = time.time() + PROBE_TIMEOUT
     last: ActualState = ActualState(health="STARTING")
     while time.time() < deadline:
+        _raise_if_vllm_container_exited()
         last = _probe_vllm(model_id)
         if last.health == "HEALTHY" and last.model_loaded:
             return last
