@@ -5,17 +5,18 @@ from unittest.mock import AsyncMock, patch
 import pytest
 import pytest_asyncio
 
-import models
+import artifacts
 import state
+from serving.types import compute_config_hash
 from exceptions import TransientDockerError
 from reconciler import Reconciler
 from schemas import ActualState, ApplianceState, DesiredState
 
 
 @pytest_asyncio.fixture
-async def ready_reconciler(fresh_state):
+async def ready_reconciler(fresh_state, serving_backend):
     await fresh_state.seed_defaults()
-    return Reconciler("integration-appliance")
+    return Reconciler("integration-appliance", serving_backend=serving_backend)
 
 
 @pytest.mark.integration
@@ -23,7 +24,7 @@ async def ready_reconciler(fresh_state):
 async def test_full_reconcile_cycle_persists_ready_state(
     ready_reconciler, sample_desired, patch_reconcile_externals
 ):
-    config_hash = models.compute_config_hash(sample_desired)
+    config_hash = compute_config_hash(sample_desired)
     healthy = ActualState(
         model_loaded=True,
         current_model=sample_desired.model,
@@ -35,11 +36,11 @@ async def test_full_reconcile_cycle_persists_ready_state(
     )
 
     with (
-        patch.object(models, "get_deployment_status", AsyncMock(return_value=ActualState(health="STOPPED"))),
-        patch.object(models, "ensure_artifact", return_value="/cache/model"),
-        patch.object(models, "stop_vllm_if_needed", AsyncMock(return_value=0)),
-        patch.object(models, "start_or_update_vllm", AsyncMock(return_value="cid-ready")),
-        patch.object(models, "wait_for_probes", AsyncMock(return_value=healthy)),
+        patch.object(ready_reconciler.serving, "get_deployment_status", AsyncMock(return_value=ActualState(health="STOPPED"))),
+        patch.object(artifacts, "ensure_artifact", return_value="/cache/model"),
+        patch.object(ready_reconciler.serving, "stop_if_needed", AsyncMock(return_value=0)),
+        patch.object(ready_reconciler.serving, "start_or_update", AsyncMock(return_value="cid-ready")),
+        patch.object(ready_reconciler.serving, "wait_for_probes", AsyncMock(return_value=healthy)),
     ):
         await ready_reconciler.reconcile_once()
 
@@ -79,15 +80,15 @@ async def test_docker_transient_error_stays_reconciling(
     ready_reconciler, sample_desired, patch_reconcile_externals
 ):
     with (
-        patch.object(models, "get_deployment_status", AsyncMock(return_value=ActualState(health="STOPPED"))),
-        patch.object(models, "ensure_artifact", return_value="/cache/model"),
-        patch.object(models, "stop_vllm_if_needed", AsyncMock(return_value=0)),
+        patch.object(ready_reconciler.serving, "get_deployment_status", AsyncMock(return_value=ActualState(health="STOPPED"))),
+        patch.object(artifacts, "ensure_artifact", return_value="/cache/model"),
+        patch.object(ready_reconciler.serving, "stop_if_needed", AsyncMock(return_value=0)),
         patch.object(
-            models,
-            "start_or_update_vllm",
+            ready_reconciler.serving,
+            "start_or_update",
             AsyncMock(side_effect=TransientDockerError("409 conflict")),
         ),
-        patch.object(models, "heal_deployment_environment", return_value=["removed stale"]),
+        patch.object(ready_reconciler.serving, "heal_environment", AsyncMock(return_value=["removed stale"])),
         patch("reconciler._poll_starting_progress", AsyncMock()),
     ):
         await ready_reconciler.reconcile_once()
@@ -105,7 +106,7 @@ async def test_conflicting_intents_resolve_by_sequence(ready_reconciler):
     await state.append_intent("load_model", {"model": "third/model", "context_length": 3072})
 
     with (
-        patch.object(models, "get_deployment_status", AsyncMock(return_value=ActualState(health="STOPPED"))),
+        patch.object(ready_reconciler.serving, "get_deployment_status", AsyncMock(return_value=ActualState(health="STOPPED"))),
         patch("reconciler.gpu.is_gpu_available", return_value=False),
     ):
         await ready_reconciler.reconcile_once()
@@ -121,10 +122,10 @@ async def test_vram_insufficient_degraded_with_actionable_error(ready_reconciler
     vram_msg = "GPU VRAM likely insufficient for test"
 
     with (
-        patch.object(models, "get_deployment_status", AsyncMock(return_value=ActualState(health="STOPPED"))),
+        patch.object(ready_reconciler.serving, "get_deployment_status", AsyncMock(return_value=ActualState(health="STOPPED"))),
         patch("reconciler.gpu.is_gpu_available", return_value=True),
         patch("reconciler.gpu.check_vram_for_model", return_value=vram_msg),
-        patch.object(models, "prune_exited_vllm_containers", return_value=[]),
+        patch.object(ready_reconciler.serving, "prune_exited", AsyncMock(return_value=[])),
     ):
         await ready_reconciler.reconcile_once()
 

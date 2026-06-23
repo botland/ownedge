@@ -100,7 +100,7 @@ Customer → Traefik (:80) → LiteLLM → inferedge-vllm:8000 (dynamic)
                               ↑
                          Controller (:8080)
                               ↓
-                    SQLite + Ray (compute adapter)
+                    SQLite + pluggable ServingBackend (litellm_vllm default)
                               ↓
                     vLLM container (Docker labels)
 ```
@@ -110,8 +110,8 @@ Customer → Traefik (:80) → LiteLLM → inferedge-vllm:8000 (dynamic)
 | Layer | Writes | Reads |
 |---|---|---|
 | API (`main.py`) | `intent_log` only | SQLite cache |
-| Reconciler | `desired_state`, `appliance_state`, `deployments`, `reconcile_log` | Docker via `models.py` |
-| `models.py` | Docker containers | — |
+| Reconciler | `desired_state`, `appliance_state`, `deployments`, `reconcile_log` | `artifacts.py` + `ServingBackend` |
+| `ServingBackend` | Runtime deployment (Docker or Ray Serve) | — |
 
 ### vLLM Label Identity
 

@@ -4,8 +4,8 @@ Layering Rules
 --------------
 - This module is the ONLY writer to desired_state, appliance_state, deployments,
   and reconcile_log.
-- This module is the ONLY caller of models.py (Docker / vLLM operations).
-- The API layer appends intents only; it never imports models.py or calls
+- This module is the ONLY caller of serving backends and artifacts.
+- The API layer appends intents only; it never imports serving/artifacts or calls
   update_desired_state() directly.
 """
 
@@ -14,9 +14,11 @@ import logging
 import os
 import time
 
+import artifacts
 import gpu
-import models
 import state
+from serving.base import AbstractServingBackend
+from serving.types import apply_gpu_profile, compute_config_hash, normalize_model_key
 from exceptions import (
     ArtifactError,
     DockerError,
@@ -55,10 +57,12 @@ VLLM_START_TIMEOUT = int(
 )
 
 
-async def _poll_starting_progress(model_id: str, stop: asyncio.Event) -> None:
+async def _poll_starting_progress(
+    serving: AbstractServingBackend, model_id: str, stop: asyncio.Event
+) -> None:
     """Keep /status fresh while vLLM image pull + container create runs."""
     while not stop.is_set():
-        pull = await asyncio.to_thread(models.get_vllm_pull_progress)
+        pull = await serving.get_start_progress()
         if pull:
             progress_msg = (
                 f"pulling vLLM image: {pull['percent']:.1f}% ({pull['human']})"
@@ -78,11 +82,14 @@ async def _poll_starting_progress(model_id: str, stop: asyncio.Event) -> None:
 
 
 async def _poll_loading_progress(
-    model_id: str, container_id: str, stop: asyncio.Event
+    serving: AbstractServingBackend,
+    model_id: str,
+    container_id: str,
+    stop: asyncio.Event,
 ) -> None:
     """Keep /status fresh while vLLM loads weights (API may be unreachable)."""
     while not stop.is_set():
-        hint = await asyncio.to_thread(models.get_vllm_load_hint, container_id)
+        hint = await serving.get_load_hint(container_id)
         detail = f" ({hint})" if hint else ""
         await state.set_appliance_state(
             ApplianceState.RECONCILING,
@@ -103,7 +110,7 @@ async def _poll_loading_progress(
 async def _poll_download_progress(model_id: str, stop: asyncio.Event) -> None:
     """Update /status while a blocking HF download runs in a worker thread."""
     while not stop.is_set():
-        stats = await asyncio.to_thread(models.get_cache_stats, model_id)
+        stats = await asyncio.to_thread(artifacts.get_cache_stats, model_id)
         await state.set_appliance_state(
             ApplianceState.RECONCILING,
             last_error=(
@@ -127,8 +134,9 @@ async def _poll_download_progress(model_id: str, stop: asyncio.Event) -> None:
 
 
 class Reconciler:
-    def __init__(self, appliance_id: str) -> None:
+    def __init__(self, appliance_id: str, serving_backend: AbstractServingBackend) -> None:
         self.appliance_id = appliance_id
+        self.serving = serving_backend
         self._gate = asyncio.Lock()
         self._busy = False
         self._phase: str | None = None
@@ -167,7 +175,7 @@ class Reconciler:
 
     async def _prewarm_vllm_image(self) -> None:
         try:
-            await asyncio.to_thread(models.prewarm_vllm_image)
+            await self.serving.prewarm()
         except Exception as exc:
             logger.warning("Background vLLM image prewarm failed (will retry): %s", exc)
 
@@ -203,7 +211,7 @@ class Reconciler:
             if phase_stale < threshold:
                 return
 
-        container_running = await asyncio.to_thread(models.is_vllm_container_running)
+        container_running = await self.serving.is_running()
         if health == "LOADING" and container_running:
             return
 
@@ -217,7 +225,7 @@ class Reconciler:
             self._phase,
         )
         actions = await asyncio.to_thread(
-            models.heal_deployment_environment, force_restart
+            self.serving.heal_environment, force_restart
         )
         summary = "; ".join(actions) if actions else "no container changes"
         await state.set_appliance_state(
@@ -259,10 +267,10 @@ class Reconciler:
             desired = await state.get_desired_state()
             resolved_model = await state.resolve_model(desired.model)
             desired = desired.model_copy(update={"model": resolved_model})
-            desired = await asyncio.to_thread(models.apply_gpu_profile, desired, resolved_model)
+            desired = await asyncio.to_thread(apply_gpu_profile, desired, resolved_model)
 
-            config_hash = models.compute_config_hash(desired)
-            actual = await models.get_deployment_status(resolved_model)
+            config_hash = compute_config_hash(desired)
+            actual = await self.serving.get_deployment_status(resolved_model)
             deployment = await state.get_deployment_record()
 
             hash_match = actual.config_hash == config_hash and actual.health == "HEALTHY" and actual.model_loaded
@@ -281,14 +289,14 @@ class Reconciler:
                 )
                 return
 
-            if intents_processed == 0 and models.has_vllm_load_failure(config_hash, deployment):
-                await asyncio.to_thread(models.prune_exited_vllm_containers)
+            if intents_processed == 0 and self.serving.has_load_failure(config_hash, deployment):
+                await self.serving.prune_exited()
                 last_error = await asyncio.to_thread(
                     gpu.check_vram_for_model,
                     resolved_model,
                     desired.context_length,
                     desired.gpu_utilization,
-                ) or models.format_vllm_load_error(deployment)
+                ) or self.serving.format_load_error(deployment)
                 await state.update_desired_state(desired)
                 await state.set_appliance_state(
                     ApplianceState.DEGRADED,
@@ -307,7 +315,7 @@ class Reconciler:
             if not await asyncio.to_thread(gpu.is_gpu_available):
                 last_error = "No GPU detected. Appliance running in CPU-only degraded mode."
                 new_state = ApplianceState.DEGRADED
-                actual = await models.get_deployment_status(resolved_model)
+                actual = await self.serving.get_deployment_status(resolved_model)
                 await state.update_desired_state(desired)
                 await state.set_appliance_state(new_state, last_error, time.time(), actual=actual)
                 await state.log_reconcile_event(
@@ -323,10 +331,10 @@ class Reconciler:
                 desired.gpu_utilization,
             )
             if vram_err:
-                await asyncio.to_thread(models.prune_exited_vllm_containers)
+                await self.serving.prune_exited()
                 await state.update_desired_state(desired)
                 await state.update_deployment(exit_code=1, log_snippet=vram_err)
-                actual = await models.get_deployment_status(resolved_model)
+                actual = await self.serving.get_deployment_status(resolved_model)
                 await state.set_appliance_state(
                     ApplianceState.DEGRADED, vram_err, time.time(), actual=actual
                 )
@@ -348,19 +356,19 @@ class Reconciler:
             model_path = ""
             try:
                 model_path = await asyncio.wait_for(
-                    asyncio.to_thread(models.ensure_artifact, resolved_model),
+                    asyncio.to_thread(artifacts.ensure_artifact, resolved_model),
                     timeout=ENSURE_ARTIFACT_TIMEOUT,
                 )
             except asyncio.TimeoutError:
                 cache_target = os.path.join(
-                    models.CACHE_DIR, models.normalize_model_key(resolved_model)
+                    artifacts.CACHE_DIR, normalize_model_key(resolved_model)
                 )
-                await asyncio.to_thread(models.heal_download_environment, cache_target)
+                await asyncio.to_thread(artifacts.heal_download_environment, cache_target)
                 raise TransientArtifactError(
                     f"Model download timed out after {ENSURE_ARTIFACT_TIMEOUT}s; auto-retrying"
                 ) from None
             except TransientArtifactError as exc:
-                stats = await asyncio.to_thread(models.get_cache_stats, resolved_model)
+                stats = await asyncio.to_thread(artifacts.get_cache_stats, resolved_model)
                 await state.set_appliance_state(
                     ApplianceState.RECONCILING,
                     last_error=f"Auto-retry: {exc}",
@@ -406,11 +414,11 @@ class Reconciler:
             next_gen = await state.get_next_generation()
             stop_starting = asyncio.Event()
             starting_task = asyncio.create_task(
-                _poll_starting_progress(resolved_model, stop_starting)
+                _poll_starting_progress(self.serving, resolved_model, stop_starting)
             )
             container_id = ""
             try:
-                stopped = await models.stop_vllm_if_needed(
+                stopped = await self.serving.stop_if_needed(
                     except_hash=config_hash, except_generation=next_gen - 1
                 )
                 if stopped:
@@ -418,19 +426,19 @@ class Reconciler:
                     self.total_restarts += stopped
 
                 container_id = await asyncio.wait_for(
-                    models.start_or_update_vllm(
+                    self.serving.start_or_update(
                         resolved_model, model_path, desired, config_hash, next_gen
                     ),
                     timeout=VLLM_START_TIMEOUT,
                 )
                 logger.info("Started vLLM container %s (generation=%d)", container_id[:12], next_gen)
             except asyncio.TimeoutError:
-                await asyncio.to_thread(models.heal_deployment_environment, True)
+                await self.serving.heal_environment(True)
                 raise TransientDockerError(
                     f"vLLM start timed out after {VLLM_START_TIMEOUT}s; auto-retrying"
                 ) from None
             except TransientDockerError as exc:
-                await asyncio.to_thread(models.heal_deployment_environment, True)
+                await self.serving.heal_environment(True)
                 await state.set_appliance_state(
                     ApplianceState.RECONCILING,
                     last_error=f"Auto-retry: {exc}",
@@ -442,7 +450,7 @@ class Reconciler:
             except VllmLoadError as exc:
                 last_error = str(exc)
                 await state.update_desired_state(desired)
-                actual = await models.get_deployment_status(resolved_model)
+                actual = await self.serving.get_deployment_status(resolved_model)
                 await state.set_appliance_state(
                     ApplianceState.DEGRADED, last_error, time.time(), actual=actual
                 )
@@ -460,7 +468,7 @@ class Reconciler:
                 last_error = str(exc)
                 new_state = ApplianceState.FAILED
                 await state.update_desired_state(desired)
-                actual = await models.get_deployment_status(resolved_model)
+                actual = await self.serving.get_deployment_status(resolved_model)
                 await state.set_appliance_state(new_state, last_error, time.time(), actual=actual)
                 await state.log_reconcile_event(
                     "docker_error",
@@ -479,7 +487,7 @@ class Reconciler:
             self._begin_phase("LOADING")
             stop_loading = asyncio.Event()
             loading_task = asyncio.create_task(
-                _poll_loading_progress(resolved_model, container_id, stop_loading)
+                _poll_loading_progress(self.serving, resolved_model, container_id, stop_loading)
             )
             await state.set_appliance_state(
                 ApplianceState.RECONCILING,
@@ -495,13 +503,13 @@ class Reconciler:
             probe_timeout = int(os.environ.get("VLLM_PROBE_TIMEOUT_SEC", "600"))
             try:
                 actual = await asyncio.wait_for(
-                    models.wait_for_probes(resolved_model),
+                    self.serving.wait_for_probes(resolved_model),
                     timeout=probe_timeout + 30,
                 )
                 new_state = ApplianceState.READY
             except asyncio.TimeoutError:
-                actual = await models.get_deployment_status(resolved_model)
-                if await asyncio.to_thread(models.is_vllm_container_running):
+                actual = await self.serving.get_deployment_status(resolved_model)
+                if await self.serving.is_running():
                     last_error = (
                         f"Still loading {resolved_model} (API not ready after "
                         f"{probe_timeout}s; container running)"
@@ -509,13 +517,13 @@ class Reconciler:
                     new_state = ApplianceState.RECONCILING
                     logger.info("%s", last_error)
                 elif actual.exit_code not in (None, 0):
-                    last_error = models.format_vllm_load_error(
+                    last_error = self.serving.format_load_error(
                         {**deployment, "exit_code": actual.exit_code, "log_snippet": actual.log_snippet}
                     )
                     new_state = ApplianceState.DEGRADED
                     logger.warning("%s", last_error)
                 else:
-                    await asyncio.to_thread(models.heal_deployment_environment, True)
+                    await self.serving.heal_environment(True)
                     last_error = (
                         f"vLLM probes timed out after {probe_timeout}s; auto-retrying"
                     )
@@ -524,8 +532,8 @@ class Reconciler:
                 await state.set_appliance_state(new_state, last_error, time.time(), actual=actual)
                 return
             except ProbeTimeoutError as exc:
-                actual = await models.get_deployment_status(resolved_model)
-                if await asyncio.to_thread(models.is_vllm_container_running):
+                actual = await self.serving.get_deployment_status(resolved_model)
+                if await self.serving.is_running():
                     last_error = (
                         f"Still loading {resolved_model} (API not ready after "
                         f"{probe_timeout}s; container running)"
@@ -533,13 +541,13 @@ class Reconciler:
                     new_state = ApplianceState.RECONCILING
                     logger.info("%s", last_error)
                 elif actual.exit_code not in (None, 0):
-                    last_error = models.format_vllm_load_error(
+                    last_error = self.serving.format_load_error(
                         {**deployment, "exit_code": actual.exit_code, "log_snippet": actual.log_snippet}
                     )
                     new_state = ApplianceState.DEGRADED
                     logger.warning("%s", last_error)
                 else:
-                    await asyncio.to_thread(models.heal_deployment_environment, True)
+                    await self.serving.heal_environment(True)
                     last_error = f"Auto-retry: {exc}"
                     new_state = ApplianceState.RECONCILING
                     logger.warning("Probe timeout (will retry): %s", exc)
@@ -548,7 +556,7 @@ class Reconciler:
             except VllmLoadError as exc:
                 last_error = str(exc)
                 await state.update_desired_state(desired)
-                actual = await models.get_deployment_status(resolved_model)
+                actual = await self.serving.get_deployment_status(resolved_model)
                 await state.set_appliance_state(
                     ApplianceState.DEGRADED, last_error, time.time(), actual=actual
                 )
@@ -566,7 +574,7 @@ class Reconciler:
                 last_error = str(exc)
                 new_state = ApplianceState.FAILED
                 await state.update_desired_state(desired)
-                actual = await models.get_deployment_status(resolved_model)
+                actual = await self.serving.get_deployment_status(resolved_model)
                 await state.set_appliance_state(new_state, last_error, time.time(), actual=actual)
                 await state.log_reconcile_event(
                     "docker_error",
@@ -595,7 +603,7 @@ class Reconciler:
             logger.warning("Transient download issue (will retry): %s", exc)
             action_taken = True
         except TransientDockerError as exc:
-            await asyncio.to_thread(models.heal_deployment_environment, True)
+            await self.serving.heal_environment(True)
             await state.set_appliance_state(
                 ApplianceState.RECONCILING,
                 last_error=f"Auto-retry: {exc}",

@@ -4,8 +4,7 @@ from abc import ABC, abstractmethod
 class AbstractScheduler(ABC):
     """Abstract compute scheduler adapter.
 
-    Phase 1 uses LocalScheduler (in-process Ray). Future phases may swap in
-    a multi-node Ray implementation without changing the reconciler or API.
+    Active only in ray_cluster mode (external Ray). litellm_vllm mode has no scheduler.
     """
 
     @abstractmethod
