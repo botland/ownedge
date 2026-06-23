@@ -4,7 +4,7 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT"
 
-docker build -q -t inferedge-controller-test inferedge-phase1/controller
+docker build -q -t inferedge-controller-test controller
 
 docker run --rm \
   -v "$ROOT/inferedge-phase1/controller:/app" \

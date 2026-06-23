@@ -1,7 +1,7 @@
 import time
 from unittest.mock import AsyncMock, patch
 
-import models
+import artifacts
 
 import pytest
 import pytest_asyncio
@@ -10,6 +10,7 @@ import state
 from exceptions import ArtifactError, DockerError, TransientArtifactError, VllmLoadError
 from reconciler import Reconciler
 from schemas import ActualState, ApplianceState, DesiredState
+from serving.types import compute_config_hash
 
 
 @pytest_asyncio.fixture
@@ -18,13 +19,8 @@ async def seeded_db(fresh_state):
     return fresh_state
 
 
-@pytest.fixture
-def reconciler():
-    return Reconciler("test-appliance-001")
-
-
 def _matching_healthy_actual(sample_desired):
-    config_hash = models.compute_config_hash(sample_desired)
+    config_hash = compute_config_hash(sample_desired)
     return ActualState(
         model_loaded=True,
         current_model=sample_desired.model,
@@ -34,25 +30,25 @@ def _matching_healthy_actual(sample_desired):
 
 
 @pytest.fixture
-def noop_patches():
+def noop_patches(serving_backend):
     """Patches that keep reconcile focused on the code path under test."""
     return {
-        "apply_gpu_profile": patch.object(models, "apply_gpu_profile", side_effect=lambda d, m: d),
+        "apply_gpu_profile": patch("reconciler.apply_gpu_profile", side_effect=lambda d, m: d),
         "is_gpu_available": patch("reconciler.gpu.is_gpu_available", return_value=True),
         "check_vram": patch("reconciler.gpu.check_vram_for_model", return_value=None),
-        "load_hint": patch.object(models, "get_vllm_load_hint", return_value=None),
+        "load_hint": patch.object(serving_backend, "get_load_hint", AsyncMock(return_value=None)),
     }
 
 
 @pytest.mark.asyncio
-async def test_reconcile_noop_when_ready(reconciler, seeded_db, sample_desired, noop_patches):
+async def test_reconcile_noop_when_ready(reconciler, serving_backend, seeded_db, sample_desired, noop_patches):
     healthy = _matching_healthy_actual(sample_desired)
 
     with (
         noop_patches["apply_gpu_profile"],
         noop_patches["is_gpu_available"],
         noop_patches["check_vram"],
-        patch.object(models, "get_deployment_status", AsyncMock(return_value=healthy)),
+        patch.object(serving_backend, "get_deployment_status", AsyncMock(return_value=healthy)),
         patch.object(state, "log_reconcile_event", AsyncMock()) as log_event,
     ):
         await reconciler.reconcile_once()
@@ -63,11 +59,11 @@ async def test_reconcile_noop_when_ready(reconciler, seeded_db, sample_desired, 
 
 
 @pytest.mark.asyncio
-async def test_reconcile_gpu_unavailable_degraded(reconciler, seeded_db, sample_desired):
+async def test_reconcile_gpu_unavailable_degraded(reconciler, serving_backend, seeded_db, sample_desired):
     actual = ActualState(health="STOPPED")
 
     with (
-        patch.object(models, "get_deployment_status", AsyncMock(return_value=actual)),
+        patch.object(serving_backend, "get_deployment_status", AsyncMock(return_value=actual)),
         patch("reconciler.gpu.is_gpu_available", return_value=False),
         patch.object(state, "log_reconcile_event", AsyncMock()) as log_event,
     ):
@@ -81,8 +77,10 @@ async def test_reconcile_gpu_unavailable_degraded(reconciler, seeded_db, sample_
 
 
 @pytest.mark.asyncio
-async def test_reconcile_vllm_load_failure_short_circuit(reconciler, seeded_db, sample_desired, noop_patches):
-    config_hash = models.compute_config_hash(sample_desired)
+async def test_reconcile_vllm_load_failure_short_circuit(
+    reconciler, serving_backend, seeded_db, sample_desired, noop_patches
+):
+    config_hash = compute_config_hash(sample_desired)
     actual = ActualState(health="STOPPED", config_hash=config_hash)
     deployment = {
         "config_hash": config_hash,
@@ -90,13 +88,15 @@ async def test_reconcile_vllm_load_failure_short_circuit(reconciler, seeded_db, 
         "log_snippet": "ValueError: KV cache too small",
     }
     await state.update_deployment(**deployment)
+    serving_backend.has_load_failure.return_value = True
+    serving_backend.format_load_error.return_value = "vLLM failed to load model: KV cache too small"
 
     with (
         noop_patches["apply_gpu_profile"],
         noop_patches["is_gpu_available"],
         noop_patches["check_vram"],
-        patch.object(models, "get_deployment_status", AsyncMock(return_value=actual)),
-        patch.object(models, "prune_exited_vllm_containers", return_value=[]),
+        patch.object(serving_backend, "get_deployment_status", AsyncMock(return_value=actual)),
+        patch.object(serving_backend, "prune_exited", AsyncMock(return_value=[])),
         patch.object(state, "log_reconcile_event", AsyncMock()) as log_event,
     ):
         await reconciler.reconcile_once()
@@ -108,14 +108,14 @@ async def test_reconcile_vllm_load_failure_short_circuit(reconciler, seeded_db, 
 
 
 @pytest.mark.asyncio
-async def test_reconcile_artifact_error_degraded(reconciler, seeded_db, sample_desired):
+async def test_reconcile_artifact_error_degraded(reconciler, serving_backend, seeded_db, sample_desired):
     actual = ActualState(health="STOPPED")
 
     with (
-        patch.object(models, "get_deployment_status", AsyncMock(return_value=actual)),
+        patch.object(serving_backend, "get_deployment_status", AsyncMock(return_value=actual)),
         patch("reconciler.gpu.is_gpu_available", return_value=True),
         patch("reconciler.gpu.check_vram_for_model", return_value=None),
-        patch.object(models, "ensure_artifact", side_effect=ArtifactError("Disk full under /cache")),
+        patch.object(artifacts, "ensure_artifact", side_effect=ArtifactError("Disk full under /cache")),
         patch.object(state, "log_reconcile_event", AsyncMock()) as log_event,
     ):
         await reconciler.reconcile_once()
@@ -128,15 +128,15 @@ async def test_reconcile_artifact_error_degraded(reconciler, seeded_db, sample_d
 
 
 @pytest.mark.asyncio
-async def test_reconcile_transient_download_retries(reconciler, seeded_db, sample_desired):
+async def test_reconcile_transient_download_retries(reconciler, serving_backend, seeded_db, sample_desired):
     actual = ActualState(health="STOPPED")
 
     with (
-        patch.object(models, "get_deployment_status", AsyncMock(return_value=actual)),
+        patch.object(serving_backend, "get_deployment_status", AsyncMock(return_value=actual)),
         patch("reconciler.gpu.is_gpu_available", return_value=True),
         patch("reconciler.gpu.check_vram_for_model", return_value=None),
         patch.object(
-            models,
+            artifacts,
             "ensure_artifact",
             side_effect=TransientArtifactError("Download stalled; retrying"),
         ),
@@ -151,7 +151,7 @@ async def test_reconcile_transient_download_retries(reconciler, seeded_db, sampl
 
 
 @pytest.mark.asyncio
-async def test_reconcile_happy_path_to_ready(reconciler, seeded_db, sample_desired, noop_patches):
+async def test_reconcile_happy_path_to_ready(reconciler, serving_backend, seeded_db, sample_desired, noop_patches):
     actual = ActualState(health="STOPPED")
     healthy = _matching_healthy_actual(sample_desired).model_copy(
         update={"container_id": "container-xyz"}
@@ -162,11 +162,11 @@ async def test_reconcile_happy_path_to_ready(reconciler, seeded_db, sample_desir
         noop_patches["is_gpu_available"],
         noop_patches["check_vram"],
         noop_patches["load_hint"],
-        patch.object(models, "get_deployment_status", AsyncMock(return_value=actual)),
-        patch.object(models, "ensure_artifact", return_value="/models/cache/path"),
-        patch.object(models, "stop_vllm_if_needed", AsyncMock(return_value=0)),
-        patch.object(models, "start_or_update_vllm", AsyncMock(return_value="container-xyz")),
-        patch.object(models, "wait_for_probes", AsyncMock(return_value=healthy)),
+        patch.object(serving_backend, "get_deployment_status", AsyncMock(return_value=actual)),
+        patch.object(artifacts, "ensure_artifact", return_value="/models/cache/path"),
+        patch.object(serving_backend, "stop_if_needed", AsyncMock(return_value=0)),
+        patch.object(serving_backend, "start_or_update", AsyncMock(return_value="container-xyz")),
+        patch.object(serving_backend, "wait_for_probes", AsyncMock(return_value=healthy)),
         patch.object(state, "log_reconcile_event", AsyncMock()) as log_event,
     ):
         await reconciler.reconcile_once()
@@ -180,21 +180,21 @@ async def test_reconcile_happy_path_to_ready(reconciler, seeded_db, sample_desir
 
 
 @pytest.mark.asyncio
-async def test_reconcile_vllm_load_error_on_start(reconciler, seeded_db, sample_desired):
+async def test_reconcile_vllm_load_error_on_start(reconciler, serving_backend, seeded_db, sample_desired):
     actual = ActualState(health="STOPPED")
 
     with (
-        patch.object(models, "get_deployment_status", AsyncMock(return_value=actual)),
+        patch.object(serving_backend, "get_deployment_status", AsyncMock(return_value=actual)),
         patch("reconciler.gpu.is_gpu_available", return_value=True),
         patch("reconciler.gpu.check_vram_for_model", return_value=None),
-        patch.object(models, "ensure_artifact", return_value="/models/cache/path"),
-        patch.object(models, "stop_vllm_if_needed", AsyncMock(return_value=1)),
+        patch.object(artifacts, "ensure_artifact", return_value="/models/cache/path"),
+        patch.object(serving_backend, "stop_if_needed", AsyncMock(return_value=1)),
         patch.object(
-            models,
-            "start_or_update_vllm",
+            serving_backend,
+            "start_or_update",
             AsyncMock(side_effect=VllmLoadError("vLLM failed to load model: CUDA OOM")),
         ),
-        patch.object(models, "heal_deployment_environment", return_value=[]),
+        patch.object(serving_backend, "heal_environment", AsyncMock(return_value=[])),
         patch.object(state, "log_reconcile_event", AsyncMock()) as log_event,
     ):
         await reconciler.reconcile_once()
@@ -207,21 +207,21 @@ async def test_reconcile_vllm_load_error_on_start(reconciler, seeded_db, sample_
 
 
 @pytest.mark.asyncio
-async def test_reconcile_docker_error_failed(reconciler, seeded_db, sample_desired):
+async def test_reconcile_docker_error_failed(reconciler, serving_backend, seeded_db, sample_desired):
     actual = ActualState(health="STOPPED")
 
     with (
-        patch.object(models, "get_deployment_status", AsyncMock(return_value=actual)),
+        patch.object(serving_backend, "get_deployment_status", AsyncMock(return_value=actual)),
         patch("reconciler.gpu.is_gpu_available", return_value=True),
         patch("reconciler.gpu.check_vram_for_model", return_value=None),
-        patch.object(models, "ensure_artifact", return_value="/models/cache/path"),
-        patch.object(models, "stop_vllm_if_needed", AsyncMock(return_value=0)),
+        patch.object(artifacts, "ensure_artifact", return_value="/models/cache/path"),
+        patch.object(serving_backend, "stop_if_needed", AsyncMock(return_value=0)),
         patch.object(
-            models,
-            "start_or_update_vllm",
+            serving_backend,
+            "start_or_update",
             AsyncMock(side_effect=DockerError("Failed to start vLLM container: denied")),
         ),
-        patch.object(models, "heal_deployment_environment", return_value=[]),
+        patch.object(serving_backend, "heal_environment", AsyncMock(return_value=[])),
         patch.object(state, "log_reconcile_event", AsyncMock()) as log_event,
     ):
         await reconciler.reconcile_once()
@@ -234,7 +234,7 @@ async def test_reconcile_docker_error_failed(reconciler, seeded_db, sample_desir
 
 
 @pytest.mark.asyncio
-async def test_reconcile_processes_intents_before_work(reconciler, seeded_db, sample_desired):
+async def test_reconcile_processes_intents_before_work(reconciler, serving_backend, seeded_db, sample_desired):
     await state.append_intent(
         "load_model",
         {"model": "casperhansen/llama-3-8b-instruct-awq", "context_length": 2048},
@@ -242,7 +242,7 @@ async def test_reconcile_processes_intents_before_work(reconciler, seeded_db, sa
     actual = ActualState(health="STOPPED")
 
     with (
-        patch.object(models, "get_deployment_status", AsyncMock(return_value=actual)),
+        patch.object(serving_backend, "get_deployment_status", AsyncMock(return_value=actual)),
         patch("reconciler.gpu.is_gpu_available", return_value=False),
         patch.object(state, "log_reconcile_event", AsyncMock()),
     ):
@@ -263,7 +263,7 @@ async def test_poll_download_progress_updates_status(seeded_db, sample_desired):
         await __import__("asyncio").sleep(0.05)
         stop.set()
 
-    with patch.object(models, "get_cache_stats", return_value={"bytes": 1024, "human": "1.0 KB", "weight_files": 0}):
+    with patch.object(artifacts, "get_cache_stats", return_value={"bytes": 1024, "human": "1.0 KB", "weight_files": 0}):
         await __import__("asyncio").gather(
             _poll_download_progress(sample_desired.model, stop),
             stop_soon(),

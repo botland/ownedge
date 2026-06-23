@@ -6,6 +6,8 @@ from fastapi.testclient import TestClient
 
 import state
 from schemas import ActualState, ApplianceState
+from serving import ServingStack
+from serving.docker_vllm import DockerVllmServingBackend
 
 
 @pytest.fixture
@@ -13,11 +15,10 @@ def api_client(initialized_db, env_defaults, monkeypatch):
     monkeypatch.setenv("CONTROLLER_API_TOKEN", "test-token")
     monkeypatch.setenv("APPLIANCE_ID", "test-appliance-001")
 
-    mock_scheduler = MagicMock()
-    mock_scheduler.is_ready.return_value = True
+    mock_stack = ServingStack("litellm_vllm", MagicMock(spec=DockerVllmServingBackend), None)
 
     with (
-        patch("main.get_scheduler", return_value=mock_scheduler),
+        patch("main.get_serving_stack", return_value=mock_stack),
         patch("main.Reconciler") as reconciler_cls,
         patch("main.API_TOKEN", "test-token"),
         patch("main.APPLIANCE_ID", "test-appliance-001"),
@@ -40,6 +41,8 @@ def test_health_endpoint(api_client):
     assert resp.status_code == 200
     body = resp.json()
     assert body["status"] == "ok"
+    assert body["compute_backend"] == "litellm_vllm"
+    assert body["serving_ready"] is True
     assert body["scheduler_ready"] is True
 
 
@@ -107,11 +110,10 @@ async def test_models_load_queues_intent(fresh_state, api_client):
 @pytest.mark.integration
 def test_models_load_without_token_when_disabled(initialized_db, env_defaults, monkeypatch):
     monkeypatch.setenv("CONTROLLER_API_TOKEN", "")
-    mock_scheduler = MagicMock()
-    mock_scheduler.is_ready.return_value = True
+    mock_stack = ServingStack("litellm_vllm", MagicMock(), None)
 
     with (
-        patch("main.get_scheduler", return_value=mock_scheduler),
+        patch("main.get_serving_stack", return_value=mock_stack),
         patch("main.Reconciler") as reconciler_cls,
         patch("main.API_TOKEN", ""),
     ):

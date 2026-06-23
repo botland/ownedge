@@ -18,7 +18,7 @@ from schemas import ActualState, ApplianceState, DesiredState
 
 logger = logging.getLogger(__name__)
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 DB_PATH = os.environ.get("SQLITE_DB_PATH", "/data/inferedge.db")
 
 _db: aiosqlite.Connection | None = None
@@ -110,8 +110,18 @@ async def _migration_v1(db: aiosqlite.Connection) -> None:
     )
 
 
+async def _migration_v2(db: aiosqlite.Connection) -> None:
+    try:
+        await db.execute(
+            "ALTER TABLE appliance_state ADD COLUMN compute_backend TEXT"
+        )
+    except aiosqlite.OperationalError:
+        pass
+
+
 MIGRATIONS: dict[int, Any] = {
     1: _migration_v1,
+    2: _migration_v2,
 }
 
 
@@ -403,6 +413,30 @@ async def log_reconcile_event(event: str, metrics: Optional[dict] = None) -> Non
     await db.commit()
 
 
+async def set_compute_backend(mode: str) -> None:
+    """Persist active compute backend mode (startup only)."""
+    db = await get_db()
+    await db.execute(
+        "UPDATE appliance_state SET compute_backend = ? WHERE id = 1",
+        (mode,),
+    )
+    await db.commit()
+
+
+async def get_compute_backend() -> str | None:
+    db = await get_db()
+    try:
+        async with db.execute(
+            "SELECT compute_backend FROM appliance_state WHERE id = 1"
+        ) as cur:
+            row = await cur.fetchone()
+    except aiosqlite.OperationalError:
+        return None
+    if row is None:
+        return None
+    return row["compute_backend"]
+
+
 async def build_status(appliance_id: str, actual: ActualState) -> dict:
     state, last_error, last_reconcile_ts = await get_appliance_state()
     desired = await get_desired_state()
@@ -415,4 +449,5 @@ async def build_status(appliance_id: str, actual: ActualState) -> dict:
         "actual": actual,
         "last_reconcile_ts": last_reconcile_ts,
         "last_error": last_error,
+        "compute_backend": await get_compute_backend(),
     }

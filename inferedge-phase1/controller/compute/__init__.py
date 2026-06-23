@@ -1,11 +1,12 @@
-import os
+"""Compute scheduler — only active in ray_cluster mode."""
 
 from compute.base import AbstractScheduler
-from compute.local import LocalScheduler
 
 
-def get_scheduler() -> AbstractScheduler:
-    backend = os.environ.get("COMPUTE_BACKEND", "local")
-    if backend == "local":
-        return LocalScheduler()
-    raise ValueError(f"Unknown compute backend: {backend}")
+def get_scheduler() -> AbstractScheduler | None:
+    from serving import get_serving_stack
+
+    return get_serving_stack().scheduler
+
+
+__all__ = ["AbstractScheduler", "get_scheduler"]

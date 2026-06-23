@@ -41,6 +41,7 @@ class ApplianceStatus(BaseModel):
     actual: ActualState
     last_reconcile_ts: Optional[float] = None
     last_error: Optional[str] = None
+    compute_backend: Optional[str] = None
     timestamp: str = Field(default_factory=lambda: datetime.now().isoformat())
 
 

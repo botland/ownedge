@@ -145,9 +145,9 @@ class FakeContainer:
 
 @pytest.fixture
 def fake_vllm_container(sample_desired):
-    import models
+    from serving.types import compute_config_hash, normalize_model_key
 
-    config_hash = models.compute_config_hash(sample_desired)
+    config_hash = compute_config_hash(sample_desired)
     return FakeContainer(
         id="abc123container",
         name="inferedge-vllm-gen3",
@@ -156,7 +156,7 @@ def fake_vllm_container(sample_desired):
             "inferedge.managed": "true",
             "inferedge.component": "vllm",
             "inferedge.appliance_id": "test-appliance-001",
-            "inferedge.model_key": models.normalize_model_key(sample_desired.model),
+            "inferedge.model_key": normalize_model_key(sample_desired.model),
             "inferedge.config_hash": config_hash,
             "inferedge.generation": "3",
             "inferedge.gpu_ids": "GPU-test-uuid-0001",
@@ -166,8 +166,8 @@ def fake_vllm_container(sample_desired):
 
 @pytest.fixture
 def mock_docker_client(monkeypatch, fake_vllm_container):
-    """Patch models._get_client with a lightweight fake Docker client."""
-    import models
+    """Patch serving.docker_vllm._get_client with a lightweight fake Docker client."""
+    import serving.docker_vllm as docker_vllm
 
     client = MagicMock()
     client.containers.list.return_value = [fake_vllm_container]
@@ -175,35 +175,63 @@ def mock_docker_client(monkeypatch, fake_vllm_container):
     client.images.get.side_effect = Exception("image not found")
     client.networks.get.return_value = MagicMock()
 
-    monkeypatch.setattr(models, "_docker_client", None)
-    monkeypatch.setattr(models, "_get_client", lambda: client)
+    monkeypatch.setattr(docker_vllm, "_docker_client", None)
+    monkeypatch.setattr(docker_vllm, "_get_client", lambda: client)
     return client
+
+
+@pytest.fixture
+def serving_backend():
+    """Mock serving backend for reconciler unit/integration tests."""
+    from unittest.mock import AsyncMock, MagicMock
+
+    backend = MagicMock()
+    backend.mode = "litellm_vllm"
+    backend.prewarm = AsyncMock()
+    backend.get_deployment_status = AsyncMock()
+    backend.stop_if_needed = AsyncMock(return_value=0)
+    backend.start_or_update = AsyncMock(return_value="container-deadbeef")
+    backend.wait_for_probes = AsyncMock()
+    backend.get_start_progress = AsyncMock(return_value={})
+    backend.get_load_hint = AsyncMock(return_value=None)
+    backend.is_running = AsyncMock(return_value=False)
+    backend.heal_environment = AsyncMock(return_value=[])
+    backend.prune_exited = AsyncMock(return_value=[])
+    backend.has_load_failure = MagicMock(return_value=False)
+    backend.format_load_error = MagicMock(
+        side_effect=lambda record: f"vLLM failed: {record.get('log_snippet', '')}"
+    )
+    return backend
+
+
+@pytest.fixture
+def reconciler(serving_backend):
+    from reconciler import Reconciler
+
+    return Reconciler("test-appliance-001", serving_backend=serving_backend)
 
 
 @pytest.fixture
 def patch_reconcile_externals(monkeypatch):
     """Disable GPU profiling and host GPU checks during reconciler tests."""
     import gpu
-    import models
 
-    monkeypatch.setattr(models, "apply_gpu_profile", lambda desired, _model_id: desired)
+    monkeypatch.setattr("reconciler.apply_gpu_profile", lambda desired, _model_id: desired)
     monkeypatch.setattr(gpu, "is_gpu_available", lambda: True)
     monkeypatch.setattr(gpu, "check_vram_for_model", lambda *args, **kwargs: None)
-    monkeypatch.setattr(models, "get_vllm_load_hint", lambda *args, **kwargs: None)
 
 
 @pytest.fixture
 def healthy_actual(sample_desired, fake_vllm_container):
     from schemas import ActualState
-
-    import models
+    from serving.types import compute_config_hash
 
     return ActualState(
         model_loaded=True,
         current_model=sample_desired.model,
         container_id=fake_vllm_container.id,
         health="HEALTHY",
-        config_hash=models.compute_config_hash(sample_desired),
+        config_hash=compute_config_hash(sample_desired),
         generation=3,
         gpu_ids="GPU-test-uuid-0001",
     )
