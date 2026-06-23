@@ -23,7 +23,8 @@ services:
       - ./configs/litellm/config.yaml:/app/config.yaml
     labels:
       - "traefik.enable=true"
-      - "traefik.http.routers.litellm.rule=Host(`localhost`)"
+      - "traefik.http.routers.litellm.entrypoints=web"
+      - "traefik.http.routers.litellm.rule=PathPrefix(`/`)"
       - "traefik.http.services.litellm.loadbalancer.server.port=4000"
     networks:
       - inferedge_default

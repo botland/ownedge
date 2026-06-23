@@ -1,0 +1,3 @@
+[submodule "appliance-console"]
+	path = appliance-console
+	url = git@github.com:botland/console.git

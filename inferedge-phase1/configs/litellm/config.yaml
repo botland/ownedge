@@ -1,6 +1,11 @@
 model_list:
   - model_name: default
     litellm_params:
-      model: openai/compatible
+      model: openai/casperhansen/llama-3-8b-instruct-awq
+      api_base: http://inferedge-vllm:8000/v1
+      api_key: dummy
+  - model_name: casperhansen/llama-3-8b-instruct-awq
+    litellm_params:
+      model: openai/casperhansen/llama-3-8b-instruct-awq
       api_base: http://inferedge-vllm:8000/v1
       api_key: dummy

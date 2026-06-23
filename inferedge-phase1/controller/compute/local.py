@@ -20,7 +20,7 @@ class LocalScheduler(AbstractScheduler):
         dashboard_port = int(os.environ.get("RAY_DASHBOARD_PORT", "8265"))
         ray.init(
             address="local",
-            include_dashboard=True,
+            include_dashboard=False,
             dashboard_port=dashboard_port,
             logging_level=logging.WARNING,
             ignore_reinit_error=True,
